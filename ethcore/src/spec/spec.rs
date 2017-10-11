@@ -797,6 +797,10 @@ impl Spec {
 	pub fn new_pow_test_spec() -> Self {
 		load_bundled!("ethereum/olympic")
 	}
+
+	pub fn new_byzantium_test() -> Spec {
+		load_bundled!("ethereum/byzantium_test")
+	}
 }
 
 #[cfg(test)]

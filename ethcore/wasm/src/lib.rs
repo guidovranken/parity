@@ -117,6 +117,21 @@ impl vm::Vm for WasmInterpreter {
 
 		let mut cursor = ::std::io::Cursor::new(&*code);
 
+        panic!("This code is disabled");
+        /* This code is disabled because it made the project unable to compile
+			error[E0061]: this function takes 2 parameters but 1 parameter was supplied
+			   --> ethcore/wasm/src/lib.rs:121:4
+				|
+			121 | / 			elements::Module::deserialize(
+			122 | | 				&mut cursor
+			123 | | 			).map_err(|err| {
+			124 | | 				vm::Error::Wasm(format!("Error deserializing contract code ({:?})", err))
+			125 | | 			})?
+				| |______^ expected 2 parameters
+
+			error: aborting due to previous error
+		*/
+        /*
 		let contract_module = wasm_utils::inject_gas_counter(
 			elements::Module::deserialize(
 				&mut cursor
@@ -176,5 +191,6 @@ impl vm::Vm for WasmInterpreter {
 				apply_state: true,
 			})
 		}
+        */
 	}
 }

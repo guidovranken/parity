@@ -163,6 +163,36 @@ impl<'a> EvmTestClient<'a> {
 		Ok(state)
 	}
 
+	pub fn call_envinfo<T: trace::VMTracer>(&mut self,
+		    env_info: client::EnvInfo,
+            params: ActionParams, vm_tracer: &mut T)
+		-> Result<FinalizationResult, EvmTestError>
+	{
+		let genesis = self.spec.genesis_header();
+        /*
+		let info = client::EnvInfo {
+			number: genesis.number(),
+			author: *genesis.author(),
+			timestamp: genesis.timestamp(),
+			difficulty: *genesis.difficulty(),
+			last_hashes: Arc::new([H256::default(); 256].to_vec()),
+			gas_used: 0.into(),
+			gas_limit: *genesis.gas_limit(),
+		};
+        */
+		let mut substate = state::Substate::new();
+		let mut tracer = trace::NoopTracer;
+		let mut output = vec![];
+		let mut executive = executive::Executive::new(&mut self.state, &env_info, self.spec.engine.machine());
+		executive.call(
+			params,
+			&mut substate,
+			bytes::BytesRef::Flexible(&mut output),
+			&mut tracer,
+			vm_tracer,
+		).map_err(EvmTestError::Evm)
+	}
+
 	/// Execute the VM given ActionParams and tracer.
 	/// Returns amount of gas left and the output.
 	pub fn call<T: trace::VMTracer>(&mut self, params: ActionParams, vm_tracer: &mut T)

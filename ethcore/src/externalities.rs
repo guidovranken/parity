@@ -179,7 +179,10 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for Externalities<'a, T, V, B>
 			trace!("ext: blockhash contract({}) -> {:?}({}) self.env_info.number={}\n", number, r, output, self.env_info.number);
 			output
 		} else {
+			let mut output = H256::new();
+            output
 			// TODO: comment out what this function expects from env_info, since it will produce panics if the latter is inconsistent
+            /*
 			match *number < U256::from(self.env_info.number) && number.low_u64() >= cmp::max(256, self.env_info.number) - 256 {
 				true => {
 					let index = self.env_info.number - number.low_u64() - 1;
@@ -193,6 +196,7 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for Externalities<'a, T, V, B>
 					H256::zero()
 				},
 			}
+            */
 		}
 	}
 

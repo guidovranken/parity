@@ -301,18 +301,24 @@ impl<Cost: CostType> Interpreter<Cost> {
 		match instruction {
 			instructions::JUMP => {
 				let jump = stack.pop_back();
+                return Err(vm::Error::OutOfBounds);
+                /*
 				return Ok(InstructionResult::JumpToPosition(
 					jump
 				));
+                */
 			},
 			instructions::JUMPI => {
 				let jump = stack.pop_back();
 				let condition = stack.pop_back();
+                return Err(vm::Error::OutOfBounds);
+                /*
 				if !self.is_zero(&condition) {
 					return Ok(InstructionResult::JumpToPosition(
 						jump
 					));
 				}
+                */
 			},
 			instructions::JUMPDEST => {
 				// ignore

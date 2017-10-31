@@ -216,7 +216,7 @@ impl VMTracer for ExecutiveVMTracer {
 		});
 	}
 
-	fn trace_executed(&mut self, gas_used: U256, stack_push: &[U256], mem_diff: Option<(usize, &[u8])>, store_diff: Option<(U256, U256)>) {
+	fn trace_executed(&mut self, gas_used: U256, stack_push: &[U256], mem_diff: Option<(usize, &[u8])>, store_diff: Option<(U256, U256)>, msize: usize) {
 		let ex = VMExecutedOperation {
 			gas_used: gas_used,
 			stack_push: stack_push.iter().cloned().collect(),

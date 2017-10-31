@@ -141,6 +141,8 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 			let info = &infos[instruction as usize];
 			self.verify_instruction(ext, instruction, info, &stack)?;
 
+            let msize_copy = self.mem.size();
+
 			// Calculate gas cost
 			let requirements = gasometer.requirements(ext, instruction, info, &stack, self.mem.size())?;
 			if do_trace {
@@ -159,6 +161,7 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 				false => (None, None),
 			};
 
+
 			// Execute instruction
 			let result = self.exec_instruction(
 				gasometer.current_gas, &params, ext, instruction, &mut reader, &mut stack, requirements.provide_gas
@@ -176,6 +179,7 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 					stack.peek_top(info.ret),
 					mem_written.map(|(o, s)| (o, &(self.mem[o..o+s]))),
 					store_written,
+                    msize_copy,
 				);
 			}
 

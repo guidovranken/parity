@@ -410,8 +410,8 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for Externalities<'a, T, V, B>
 		self.vm_tracer.trace_prepare_execute(pc, instruction, gas_cost)
 	}
 
-	fn trace_executed(&mut self, gas_used: U256, stack_push: &[U256], mem_diff: Option<(usize, &[u8])>, store_diff: Option<(U256, U256)>) {
-		self.vm_tracer.trace_executed(gas_used, stack_push, mem_diff, store_diff)
+	fn trace_executed(&mut self, gas_used: U256, stack_push: &[U256], mem_diff: Option<(usize, &[u8])>, store_diff: Option<(U256, U256)>, msize: usize) {
+		self.vm_tracer.trace_executed(gas_used, stack_push, mem_diff, store_diff, msize)
 	}
 }
 

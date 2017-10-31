@@ -84,7 +84,7 @@ impl VMTracer for NoopVMTracer {
 
 	fn trace_prepare_execute(&mut self, _pc: usize, _instruction: u8, _gas_cost: U256) {}
 
-	fn trace_executed(&mut self, _gas_used: U256, _stack_push: &[U256], _mem_diff: Option<(usize, &[u8])>, _store_diff: Option<(U256, U256)>) {}
+	fn trace_executed(&mut self, _gas_used: U256, _stack_push: &[U256], _mem_diff: Option<(usize, &[u8])>, _store_diff: Option<(U256, U256)>, _msize: usize) {}
 
 	fn prepare_subtrace(&self, _code: &[u8]) -> Self { NoopVMTracer }
 

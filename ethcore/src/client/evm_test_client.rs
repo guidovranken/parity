@@ -227,7 +227,7 @@ impl<'a> EvmTestClient<'a> {
 		env_info: &client::EnvInfo,
 		transaction: transaction::SignedTransaction,
 		vm_tracer: T,
-	) -> TransactResult {
+	) -> TransactResult<T::Output> {
 		let initial_gas = transaction.gas;
 		// Verify transaction
 		let is_ok = transaction.verify_basic(true, None, env_info.number >= self.spec.engine.params().eip86_transition);
@@ -248,7 +248,8 @@ impl<'a> EvmTestClient<'a> {
 				TransactResult::Ok {
 					state_root: *self.state.root(),
 					gas_left: initial_gas - result.receipt.gas_used,
-					output: result.output
+					output: result.output,
+					vm_trace: result.vm_trace,
 				}
 			},
 			Err(error) => TransactResult::Err {
@@ -260,7 +261,7 @@ impl<'a> EvmTestClient<'a> {
 }
 
 /// A result of applying transaction to the state.
-pub enum TransactResult {
+pub enum TransactResult<T> {
 	/// Successful execution
 	Ok {
 		/// State root
@@ -269,6 +270,8 @@ pub enum TransactResult {
 		gas_left: U256,
 		/// Output
 		output: Vec<u8>,
+		/// VM Traces
+		vm_trace: Option<T>,
 	},
 	/// Transaction failed to run
 	Err {

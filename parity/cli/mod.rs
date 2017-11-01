@@ -470,7 +470,7 @@ usage! {
 			"--jsonrpc-hosts=[HOSTS]",
 			"List of allowed Host header values. This option will validate the Host header sent by the browser, it is additional security against some attack vectors. Special options: \"all\", \"none\",.",
 
-			ARG arg_jsonrpc_threads: (usize) = 0usize, or |c: &Config| otry!(c.rpc).processing_threads,
+			ARG arg_jsonrpc_threads: (usize) = 4usize, or |c: &Config| otry!(c.rpc).processing_threads,
 			"--jsonrpc-threads=[THREADS]",
 			"Turn on additional processing threads in all RPC servers. Setting this to non-zero value allows parallel cpu-heavy queries execution.",
 
@@ -694,7 +694,7 @@ usage! {
 
 			ARG arg_min_gas_price: (Option<u64>) = None, or |c: &Config| otry!(c.mining).min_gas_price.clone(),
 			"--min-gas-price=[STRING]",
-			"Minimum amount of Wei per GAS to be paid for a transaction to be accepted for mining. Overrides --basic-tx-usd.",
+			"Minimum amount of Wei per GAS to be paid for a transaction to be accepted for mining. Overrides --usd-per-tx.",
 
 			ARG arg_author: (Option<String>) = None, or |c: &Config| otry!(c.mining).author.clone(),
 			"--author=[ADDRESS]",
@@ -1449,7 +1449,7 @@ mod tests {
 			arg_jsonrpc_apis: "web3,eth,net,parity,traces,rpc,secretstore".into(),
 			arg_jsonrpc_hosts: "none".into(),
 			arg_jsonrpc_server_threads: None,
-			arg_jsonrpc_threads: 0,
+			arg_jsonrpc_threads: 4,
 
 			// WS
 			flag_no_ws: false,

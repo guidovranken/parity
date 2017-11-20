@@ -15,8 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::cmp::PartialEq;
-use std::collections::BTreeMap;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::{Arc, Weak};
 
@@ -348,7 +347,7 @@ impl FullDependencies {
 					).to_delegate())
 				},
 				Api::Traces => {
-					handler.extend_with(TracesClient::new(&self.client, &self.miner).to_delegate())
+					handler.extend_with(TracesClient::new(&self.client).to_delegate())
 				},
 				Api::Rpc => {
 					let modules = to_modules(&apis);

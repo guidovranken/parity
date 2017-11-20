@@ -22,7 +22,7 @@ extern crate ethcore_bytes as bytes;
 extern crate common_types as types;
 extern crate ethjson;
 extern crate rlp;
-extern crate hash;
+extern crate keccak_hash as hash;
 extern crate patricia_trie as trie;
 
 mod action_params;
@@ -35,7 +35,7 @@ mod error;
 
 pub mod tests;
 
-pub use action_params::{ActionParams, ActionValue};
+pub use action_params::{ActionParams, ActionValue, ParamsType};
 pub use call_type::CallType;
 pub use env_info::{EnvInfo, LastHashes};
 pub use schedule::{Schedule, CleanDustMode};

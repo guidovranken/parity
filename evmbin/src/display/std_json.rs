@@ -19,8 +19,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use bigint::hash::H256;
-use bigint::prelude::U256;
+use ethereum_types::{H256, U256};
 use bytes::ToPretty;
 use ethcore::trace;
 
@@ -68,7 +67,7 @@ impl<T: Writer> Informant<T> {
 
 impl<T: Writer> Informant<T> {
 	fn stack(&self) -> String {
-		let items = self.stack.iter().map(display::u256_as_str).collect::<Vec<_>>();
+		let items = self.stack.iter().map(|i| format!("\"0x{:x}\"", i)).collect::<Vec<_>>();
 		format!("[{}]", items.join(","))
 	}
 
@@ -126,11 +125,11 @@ impl<T: Writer> trace::VMTracer for Informant<T> {
 
 		writeln!(
 			&mut self.sink,
-			"{{\"pc\":{pc},\"op\":{op},\"opName\":\"{name}\",\"gas\":{gas},\"stack\":{stack},\"storage\":{storage},\"depth\":{depth}}}",
+			"{{\"pc\":{pc},\"op\":{op},\"opName\":\"{name}\",\"gas\":\"0x{gas:x}\",\"stack\":{stack},\"storage\":{storage},\"depth\":{depth}}}",
 			pc = pc,
 			op = instruction,
 			name = info.name,
-			gas = display::u256_as_str(&current_gas),
+			gas = current_gas,
 			stack = stack,
 			storage = storage,
 			depth = self.depth,

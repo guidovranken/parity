@@ -30,7 +30,9 @@ pub struct MemoryDirectory {
 
 impl KeyDirectory for MemoryDirectory {
 	fn load(&self) -> Result<Vec<SafeAccount>, Error> {
-		Ok(self.accounts.read().values().cloned().flatten().collect())
+        /* Fix compilation error -- related to https://github.com/rust-lang/rust/issues/48213 - Guido */
+        panic!("not implemented")
+		/*Ok(self.accounts.read().values().cloned().flatten().collect())*/
 	}
 
 	fn update(&self, account: SafeAccount) -> Result<SafeAccount, Error> {

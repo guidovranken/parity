@@ -18,7 +18,7 @@
 
 use secret::Secret;
 use Public;
-use bigint::hash::H256;
+use ethereum_types::H256;
 pub use self::derivation::Error as DerivationError;
 
 /// Represents label that can be stored as a part of key derivation
@@ -207,12 +207,10 @@ impl ExtendedKeyPair {
 // Work is based on BIP0032
 // https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki
 mod derivation {
-
 	use rcrypto::hmac::Hmac;
 	use rcrypto::mac::Mac;
 	use rcrypto::sha2::Sha512;
-	use bigint::hash::{H512, H256};
-	use bigint::prelude::{U256, U512};
+	use ethereum_types::{U256, U512, H512, H256};
 	use secp256k1::key::{SecretKey, PublicKey};
 	use SECP256K1;
 	use keccak;
@@ -388,7 +386,7 @@ mod tests {
 	use super::{ExtendedSecret, ExtendedPublic, ExtendedKeyPair};
 	use secret::Secret;
 	use std::str::FromStr;
-	use bigint::hash::{H128, H256};
+	use ethereum_types::{H128, H256};
 	use super::{derivation, Derivation};
 
 	fn master_chain_basic() -> (H256, H256) {

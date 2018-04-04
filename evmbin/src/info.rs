@@ -17,11 +17,11 @@
 //! VM runner.
 
 use std::time::{Instant, Duration};
-use bigint::prelude::U256;
-use bigint::hash::H256;
-use ethcore::{trace, spec, transaction, pod_state};
+use ethereum_types::{H256, U256};
 use ethcore::client::{self, EvmTestClient, EvmTestError, TransactResult};
+use ethcore::{trace, spec, pod_state};
 use ethjson;
+use transaction;
 use vm::ActionParams;
 
 /// VM execution informant
@@ -74,7 +74,7 @@ pub fn run_action<T: Informant>(
 	informant.set_gas(params.gas);
 	run(spec, params.gas, None, |mut client| {
 		let result = client
-			.call(params, &mut informant)
+			.call(params, &mut trace::NoopTracer, &mut informant)
 			.map(|r| (0.into(), r.gas_left, r.return_data.to_vec()));
 		(result, informant.drain())
 	})
@@ -106,7 +106,7 @@ pub fn run_transaction<T: Informant>(
 	informant.set_gas(env_info.gas_limit);
 
 	let result = run(spec, env_info.gas_limit, pre_state, |mut client| {
-		let result = client.transact(env_info, transaction, informant);
+		let result = client.transact(env_info, transaction, trace::NoopTracer, informant);
 		match result {
 			TransactResult::Ok { state_root, .. } if state_root != post_root => {
 				(Err(EvmTestError::PostCondition(format!(
@@ -175,6 +175,7 @@ pub mod tests {
 	use std::sync::Arc;
 	use rustc_hex::FromHex;
 	use super::*;
+	use tempdir::TempDir;
 
 	pub fn run_test<T, I, F>(
 		informant: I,
@@ -191,7 +192,12 @@ pub mod tests {
 		params.code = Some(Arc::new(code.from_hex().unwrap()));
 		params.gas = gas.into();
 
+<<<<<<< HEAD
 		let spec = ::ethcore::ethereum::new_foundation(&::std::env::temp_dir());
+=======
+		let tempdir = TempDir::new("").unwrap();
+		let spec = ::ethcore::ethereum::new_foundation(&tempdir.path());
+>>>>>>> master
 		let result = run_action(&spec, params, informant);
 		match result {
 			Ok(Success { traces, .. }) => {

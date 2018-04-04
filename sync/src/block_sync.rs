@@ -21,8 +21,8 @@
 use std::collections::{HashSet, VecDeque};
 use std::cmp;
 use heapsize::HeapSizeOf;
-use bigint::hash::H256;
-use rlp::*;
+use ethereum_types::H256;
+use rlp::UntrustedRlp;
 use ethcore::views::{BlockView};
 use ethcore::header::{BlockNumber, Header as BlockHeader};
 use ethcore::client::{BlockStatus, BlockId, BlockImportError};
@@ -520,6 +520,10 @@ impl BlockDownloader {
 				},
 				Err(BlockImportError::Block(BlockError::UnknownParent(_))) => {
 					trace!(target: "sync", "Unknown new block parent, restarting sync");
+					break;
+				},
+				Err(BlockImportError::Block(BlockError::TemporarilyInvalid(_))) => {
+					debug!(target: "sync", "Block temporarily invalid, restarting sync");
 					break;
 				},
 				Err(e) => {

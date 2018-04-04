@@ -17,12 +17,12 @@
 use std::sync::Arc;
 use std::str::FromStr;
 use rustc_hex::FromHex;
-use bigint::prelude::U256;
-use util::Address;
+use ethereum_types::{U256, Address};
 
 use ethcore::miner::MinerService;
 use ethcore::client::TestBlockChainClient;
 use ethsync::ManageNetwork;
+use futures_cpupool::CpuPool;
 
 use jsonrpc_core::IoHandler;
 use v1::{ParitySet, ParitySetClient};
@@ -54,7 +54,8 @@ fn parity_set_client(
 	net: &Arc<TestManageNetwork>,
 ) -> TestParitySetClient {
 	let dapps_service = Arc::new(TestDappsService);
-	ParitySetClient::new(client, miner, updater, &(net.clone() as Arc<ManageNetwork>), Some(dapps_service), TestFetch::default())
+	let pool = CpuPool::new(1);
+	ParitySetClient::new(client, miner, updater, &(net.clone() as Arc<ManageNetwork>), Some(dapps_service), TestFetch::default(), pool)
 }
 
 #[test]
@@ -213,7 +214,7 @@ fn rpc_parity_set_hash_content() {
 
 #[test]
 fn rpc_parity_remove_transaction() {
-	use ethcore::transaction::{Transaction, Action};
+	use transaction::{Transaction, Action};
 
 	let miner = miner_service();
 	let client = client_service();
@@ -233,7 +234,7 @@ fn rpc_parity_remove_transaction() {
 	let signed = tx.fake_sign(2.into());
 	let hash = signed.hash();
 
-	let request = r#"{"jsonrpc": "2.0", "method": "parity_removeTransaction", "params":[""#.to_owned() + &format!("0x{:?}", hash) + r#""], "id": 1}"#;
+	let request = r#"{"jsonrpc": "2.0", "method": "parity_removeTransaction", "params":[""#.to_owned() + &format!("0x{:x}", hash) + r#""], "id": 1}"#;
 	let response = r#"{"jsonrpc":"2.0","result":{"blockHash":null,"blockNumber":null,"chainId":null,"condition":null,"creates":null,"from":"0x0000000000000000000000000000000000000002","gas":"0x76c0","gasPrice":"0x9184e72a000","hash":"0xa2e0da8a8064e0b9f93e95a53c2db6d01280efb8ac72a708d25487e67dd0f8fc","input":"0x","nonce":"0x1","publicKey":null,"r":"0x1","raw":"0xe9018609184e72a0008276c0940000000000000000000000000000000000000005849184e72a80800101","s":"0x1","standardV":"0x4","to":"0x0000000000000000000000000000000000000005","transactionIndex":null,"v":"0x0","value":"0x9184e72a"},"id":1}"#;
 
 	miner.pending_transactions.lock().insert(hash, signed);

@@ -1,4 +1,4 @@
-// Copyright 2015-2018 Parity Technologies (UK) Ltd.
+// Copyright 2015-2017 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,8 +16,8 @@
 
 use std::{str, fs, fmt};
 use std::time::Duration;
-use bigint::prelude::U256;
-use util::Address;
+use ethereum_types::{U256, Address};
+use futures_cpupool::CpuPool;
 use parity_version::version_data;
 use journaldb::Algorithm;
 use ethcore::spec::{Spec, SpecParams};
@@ -35,6 +35,7 @@ pub enum SpecType {
 	Kovan,
 	Olympic,
 	Classic,
+	Expanse,
 	Musicoin,
 	Ellaism,
 	Dev,
@@ -58,6 +59,7 @@ impl str::FromStr for SpecType {
 			"ropsten" => SpecType::Ropsten,
 			"kovan" | "testnet" => SpecType::Kovan,
 			"olympic" => SpecType::Olympic,
+			"expanse" => SpecType::Expanse,
 			"musicoin" => SpecType::Musicoin,
 			"ellaism" => SpecType::Ellaism,
 			"dev" => SpecType::Dev,
@@ -75,6 +77,7 @@ impl fmt::Display for SpecType {
 			SpecType::Ropsten => "ropsten",
 			SpecType::Olympic => "olympic",
 			SpecType::Classic => "classic",
+			SpecType::Expanse => "expanse",
 			SpecType::Musicoin => "musicoin",
 			SpecType::Ellaism => "ellaism",
 			SpecType::Kovan => "kovan",
@@ -93,6 +96,7 @@ impl SpecType {
 			SpecType::Ropsten => Ok(ethereum::new_ropsten(params)),
 			SpecType::Olympic => Ok(ethereum::new_olympic(params)),
 			SpecType::Classic => Ok(ethereum::new_classic(params)),
+			SpecType::Expanse => Ok(ethereum::new_expanse(params)),
 			SpecType::Musicoin => Ok(ethereum::new_musicoin(params)),
 			SpecType::Ellaism => Ok(ethereum::new_ellaism(params)),
 			SpecType::Kovan => Ok(ethereum::new_kovan(params)),
@@ -107,6 +111,7 @@ impl SpecType {
 	pub fn legacy_fork_name(&self) -> Option<String> {
 		match *self {
 			SpecType::Classic => Some("classic".to_owned()),
+			SpecType::Expanse => Some("expanse".to_owned()),
 			SpecType::Musicoin => Some("musicoin".to_owned()),
 			_ => None,
 		}
@@ -228,15 +233,15 @@ impl GasPricerConfig {
 impl Default for GasPricerConfig {
 	fn default() -> Self {
 		GasPricerConfig::Calibrated {
-			initial_minimum: 11904761856u64.into(),
-			usd_per_tx: 0.0025f32,
+			initial_minimum: 476190464u64.into(),
+			usd_per_tx: 0.0001f32,
 			recalibration_period: Duration::from_secs(3600),
 		}
 	}
 }
 
 impl GasPricerConfig {
-	pub fn to_gas_pricer(&self, fetch: FetchClient) -> GasPricer {
+	pub fn to_gas_pricer(&self, fetch: FetchClient, p: CpuPool) -> GasPricer {
 		match *self {
 			GasPricerConfig::Fixed(u) => GasPricer::Fixed(u),
 			GasPricerConfig::Calibrated { usd_per_tx, recalibration_period, .. } => {
@@ -245,7 +250,8 @@ impl GasPricerConfig {
 						usd_per_tx: usd_per_tx,
 						recalibration_period: recalibration_period,
 					},
-					fetch
+					fetch,
+					p,
 				)
 			}
 		}
@@ -359,6 +365,7 @@ mod tests {
 		assert_eq!(format!("{}", SpecType::Morden), "morden");
 		assert_eq!(format!("{}", SpecType::Olympic), "olympic");
 		assert_eq!(format!("{}", SpecType::Classic), "classic");
+		assert_eq!(format!("{}", SpecType::Expanse), "expanse");
 		assert_eq!(format!("{}", SpecType::Musicoin), "musicoin");
 		assert_eq!(format!("{}", SpecType::Kovan), "kovan");
 		assert_eq!(format!("{}", SpecType::Dev), "dev");

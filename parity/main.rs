@@ -43,18 +43,19 @@ extern crate serde;
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
-extern crate time;
 extern crate toml;
 
 extern crate ethcore;
-extern crate ethcore_devtools as devtools;
+extern crate ethcore_bytes as bytes;
 extern crate ethcore_io as io;
 extern crate ethcore_light as light;
 extern crate ethcore_logger;
-extern crate ethcore_util as util;
-extern crate ethcore_bigint as bigint;
-extern crate ethcore_bytes as bytes;
+extern crate ethcore_migrations as migrations;
+extern crate ethcore_miner as miner;
 extern crate ethcore_network as network;
+extern crate ethcore_service;
+extern crate ethcore_transaction as transaction;
+extern crate ethereum_types;
 extern crate migration as migr;
 extern crate kvdb;
 extern crate kvdb_rocksdb;
@@ -75,6 +76,7 @@ extern crate rpc_cli;
 extern crate node_filter;
 extern crate keccak_hash as hash;
 extern crate journaldb;
+extern crate registrar;
 
 #[macro_use]
 extern crate log as rlog;
@@ -95,12 +97,16 @@ extern crate pretty_assertions;
 #[cfg(windows)] extern crate ws2_32;
 #[cfg(windows)] extern crate winapi;
 
+#[cfg(test)]
+extern crate tempdir;
+
 mod account;
 mod blockchain;
 mod cache;
 mod cli;
 mod configuration;
 mod dapps;
+mod export_hardcoded_sync;
 mod ipfs;
 mod deprecated;
 mod helpers;
@@ -140,7 +146,7 @@ fn print_hash_of(maybe_file: Option<String>) -> Result<String, String> {
 	if let Some(file) = maybe_file {
 		let mut f = BufReader::new(File::open(&file).map_err(|_| "Unable to open file".to_owned())?);
 		let hash = keccak_buffer(&mut f).map_err(|_| "Unable to read from file".to_owned())?;
-		Ok(hash.hex())
+		Ok(format!("{:x}", hash))
 	} else {
 		Err("Streaming from standard input not yet supported. Specify a file.".to_owned())
 	}
@@ -170,6 +176,7 @@ fn execute(command: Execute, can_restart: bool) -> Result<PostExecutionAction, S
 		Cmd::SignerList { port, authfile } => rpc_cli::signer_list(port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::SignerReject { id, port, authfile } => rpc_cli::signer_reject(id, port, authfile).map(|s| PostExecutionAction::Print(s)),
 		Cmd::Snapshot(snapshot_cmd) => snapshot::execute(snapshot_cmd).map(|s| PostExecutionAction::Print(s)),
+		Cmd::ExportHardcodedSync(export_hs_cmd) => export_hardcoded_sync::execute(export_hs_cmd).map(|s| PostExecutionAction::Print(s)),
 	}
 }
 

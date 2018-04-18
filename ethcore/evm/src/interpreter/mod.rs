@@ -131,23 +131,40 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 			let instruction = code[reader.position];
 			reader.position += 1;
 
+			let info = &infos[instruction as usize];
+
+			match self.verify_instruction(ext, instruction, info, &stack) {
+				Ok(val) => val,
+				Err(err) => {
+					if do_trace {
+						ext.trace_next_instruction(reader.position - 1, instruction, gasometer.current_gas.as_u256());
+					}
+					return Err(From::from(err))
+				}
+			}
+
+			let msize_copy = self.mem.size();
+
+			// Calculate gas cost
+			//let requirements = gasometer.requirements(ext, instruction, info, &stack, self.mem.size())?;
+			let requirements = match gasometer.requirements(ext, instruction, info, &stack, self.mem.size()) {
+				Ok(val) => val,
+				Err(err) => {
+					return Err(From::from(err))
+				}
+			};
+
+			gasometer.verify_gas(&requirements.gas_cost)?;
+
 			// TODO: make compile-time removable if too much of a performance hit.
 			do_trace = do_trace && ext.trace_next_instruction(
 				reader.position - 1, instruction, gasometer.current_gas.as_u256(),
 			);
 
-			let info = &infos[instruction as usize];
-			self.verify_instruction(ext, instruction, info, &stack)?;
-
-            let msize_copy = self.mem.size();
-
-			// Calculate gas cost
-			let requirements = gasometer.requirements(ext, instruction, info, &stack, self.mem.size())?;
 			if do_trace {
 				ext.trace_prepare_execute(reader.position - 1, instruction, requirements.gas_cost.as_u256());
 			}
 
-			gasometer.verify_gas(&requirements.gas_cost)?;
 			self.mem.expand(requirements.memory_required_size);
 			gasometer.current_mem_gas = requirements.memory_total_gas;
 			gasometer.current_gas = gasometer.current_gas - requirements.gas_cost;
@@ -161,9 +178,7 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 
 
 			// Execute instruction
-			let result = self.exec_instruction(
-				gasometer.current_gas, &params, ext, instruction, &mut reader, &mut stack, requirements.provide_gas
-			)?;
+			let result = self.exec_instruction(gasometer.current_gas, &params, ext, instruction, &mut reader, &mut stack, requirements.provide_gas)?;
 
 			evm_debug!({ informant.after_instruction(instruction) });
 

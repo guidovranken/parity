@@ -143,8 +143,6 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 				}
 			}
 
-			let msize_copy = self.mem.size();
-
 			// Calculate gas cost
 			//let requirements = gasometer.requirements(ext, instruction, info, &stack, self.mem.size())?;
 			let requirements = match gasometer.requirements(ext, instruction, info, &stack, self.mem.size()) {
@@ -192,7 +190,7 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 					stack.peek_top(info.ret),
 					mem_written.map(|(o, s)| (o, &(self.mem[o..o+s]))),
 					store_written,
-                    msize_copy,
+                    self.mem.size(),
 				);
 			}
 

@@ -16,6 +16,7 @@
 
 //! Rust VM implementation
 
+
 #[macro_use]
 mod informant;
 mod gasometer;
@@ -28,6 +29,10 @@ use std::{cmp, mem};
 use std::sync::Arc;
 use hash::keccak;
 use ethereum_types::{U256, U512, H256, Address};
+
+extern {
+    fn sensor_callback(sensor_id: u64, val: u64, processorType: u64);
+}
 
 use vm::{
 	self, ActionParams, ActionValue, CallType, MessageCallResult,
@@ -139,6 +144,13 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 					if do_trace {
 						ext.trace_next_instruction(reader.position - 1, instruction, gasometer.current_gas.as_u256());
 					}
+					unsafe {
+						let mut sensorval = instruction as u64;
+						if ext.depth() >= 1 {
+							sensorval += 0x8000;
+						}
+						sensor_callback(0x90008, sensorval, 3);
+					}
 					return Err(From::from(err))
 				}
 			}
@@ -148,11 +160,33 @@ impl<Cost: CostType> vm::Vm for Interpreter<Cost> {
 			let requirements = match gasometer.requirements(ext, instruction, info, &stack, self.mem.size()) {
 				Ok(val) => val,
 				Err(err) => {
+					if do_trace && ext.depth() > 0 {
+						ext.trace_next_instruction(reader.position - 1, instruction, gasometer.current_gas.as_u256());
+					}
+					unsafe {
+						let mut sensorval = instruction as u64;
+						if ext.depth() >= 1 {
+							sensorval += 0x8000;
+						}
+						sensor_callback(0x90006, sensorval, 3);
+					}
 					return Err(From::from(err))
 				}
 			};
 
-			gasometer.verify_gas(&requirements.gas_cost)?;
+			if gasometer.verify_gas_bool(&requirements.gas_cost) == true {
+				if do_trace && ext.depth() > 0 {
+					ext.trace_next_instruction(reader.position - 1, instruction, gasometer.current_gas.as_u256());
+				}
+				unsafe {
+					let mut sensorval = instruction as u64;
+					if ext.depth() >= 1 {
+						sensorval += 0x8000;
+					}
+					sensor_callback(0x90007, sensorval, 3);
+				}
+				return Err(vm::Error::OutOfGas);
+			}
 
 			// TODO: make compile-time removable if too much of a performance hit.
 			do_trace = do_trace && ext.trace_next_instruction(
@@ -314,19 +348,11 @@ impl<Cost: CostType> Interpreter<Cost> {
 	) -> vm::Result<InstructionResult<Cost>> {
 		match instruction {
 			instructions::JUMP => {
-				let jump = stack.pop_back();
-				return Ok(InstructionResult::JumpToPosition(
-					jump
-				));
+				stack.pop_back();
 			},
 			instructions::JUMPI => {
-				let jump = stack.pop_back();
-				let condition = stack.pop_back();
-				if !self.is_zero(&condition) {
-					return Ok(InstructionResult::JumpToPosition(
-						jump
-					));
-				}
+				stack.pop_back();
+				stack.pop_back();
 			},
 			instructions::JUMPDEST => {
 				// ignore
@@ -915,7 +941,7 @@ fn set_sign(value: U256, sign: bool) -> U256 {
 
 #[inline]
 fn u256_to_address(value: &U256) -> Address {
-	Address::from(H256::from(value))
+	Address::from(H256::from(*value & U256::from(255) ))
 }
 
 #[inline]

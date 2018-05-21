@@ -66,6 +66,10 @@ impl<Gas: evm::CostType> Gasometer<Gas> {
 		}
 	}
 
+	pub fn verify_gas_bool(&self, gas_cost: &Gas) -> bool {
+		return &self.current_gas < gas_cost;
+	}
+
 	/// How much gas is provided to a CALL/CREATE, given that we need to deduct `needed` for this operation
 	/// and that we `requested` some.
 	pub fn gas_provided(&self, schedule: &Schedule, needed: Gas, requested: Option<U256>) -> vm::Result<Gas> {

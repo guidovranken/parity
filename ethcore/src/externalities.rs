@@ -30,6 +30,9 @@ use vm::{
 use evm::FinalizationResult;
 use transaction::UNSIGNED_SENDER;
 use trace::{Tracer, VMTracer};
+extern {
+    fn sensor_callback(sensor_id: u64, val: u64, processorType: u64);
+}
 
 /// Policy for handling output data on `RETURN` opcode.
 pub enum OutputPolicy<'a, 'b> {
@@ -233,6 +236,9 @@ impl<'a, T: 'a, V: 'a, B: 'a> Ext for Externalities<'a, T, V, B>
 			}
 		}
 		let mut ex = Executive::from_parent(self.state, self.env_info, self.machine, self.depth, self.static_flag);
+		unsafe {
+			sensor_callback(0x90009, address[19] as u64, 3);
+		}
 
 		// TODO: handle internal error separately
 		match ex.create(params, self.substate, &mut None, self.tracer, self.vm_tracer) {

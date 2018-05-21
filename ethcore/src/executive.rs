@@ -43,7 +43,7 @@ const STACK_SIZE_PER_DEPTH: usize = 24*1024;
 pub fn contract_address(address_scheme: CreateContractAddress, sender: &Address, nonce: &U256, code: &[u8]) -> (Address, Option<H256>) {
 	use rlp::RlpStream;
 
-	match address_scheme {
+    let ret = match address_scheme {
 		CreateContractAddress::FromSenderAndNonce => {
 			let mut stream = RlpStream::new_list(2);
 			stream.append(sender);
@@ -63,7 +63,33 @@ pub fn contract_address(address_scheme: CreateContractAddress, sender: &Address,
 			&mut buffer[20..].copy_from_slice(&code_hash[..]);
 			(From::from(keccak(&buffer[..])), Some(code_hash))
 		},
-	}
+	};
+
+    let mut address: Address = ret.0;
+    //let newaddress = address & address;
+    address[0] = 0;
+    address[1] = 0;
+    address[2] = 0;
+    address[3] = 0;
+    address[4] = 0;
+    address[5] = 0;
+    address[6] = 0;
+    address[7] = 0;
+    address[8] = 0;
+    address[9] = 0;
+    address[10] = 0;
+    address[11] = 0;
+    address[12] = 0;
+    address[13] = 0;
+    address[14] = 0;
+    address[15] = 0;
+    address[16] = 0;
+    address[17] = 0;
+    address[18] = 0;
+    if address[19] < 10 {
+        address[19] = 10;
+    }
+    return (address, ret.1);
 }
 
 /// Transaction execution options.

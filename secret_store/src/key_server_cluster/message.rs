@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,8 +18,8 @@ use std::fmt;
 use std::collections::{BTreeSet, BTreeMap};
 use ethkey::Secret;
 use key_server_cluster::SessionId;
-use super::{SerializableH256, SerializablePublic, SerializableSecret, SerializableSignature,
-	SerializableMessageHash, SerializableRequester, SerializableAddress};
+use super::{Error, SerializableH256, SerializablePublic, SerializableSecret,
+	SerializableSignature, SerializableMessageHash, SerializableRequester, SerializableAddress};
 
 pub type MessageSessionId = SerializableH256;
 pub type MessageNodeId = SerializablePublic;
@@ -346,7 +346,7 @@ pub struct SessionError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// When session is completed.
@@ -390,7 +390,7 @@ pub struct EncryptionSessionError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// Node is asked to be part of consensus group.
@@ -429,6 +429,8 @@ pub struct InitializeConsensusSessionWithServersSet {
 pub struct InitializeConsensusSessionOfShareAdd {
 	/// Key version.
 	pub version: SerializableH256,
+	/// Nodes that have reported version ownership.
+	pub version_holders: BTreeSet<MessageNodeId>,
 	/// threshold+1 nodes from old_nodes_set selected for shares redistribution.
 	pub consensus_group: BTreeSet<MessageNodeId>,
 	/// Old nodes set: all non-isolated owners of selected key share version.
@@ -509,7 +511,7 @@ pub struct SchnorrSigningSessionError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// Schnorr signing session completed.
@@ -662,7 +664,7 @@ pub struct EcdsaSigningSessionError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// ECDSA signing session completed.
@@ -769,7 +771,7 @@ pub struct DecryptionSessionError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// When decryption session is completed.
@@ -876,6 +878,8 @@ pub struct InitializeShareChangeSession {
 	pub key_id: MessageSessionId,
 	/// Key vesion to use in ShareAdd session.
 	pub version: SerializableH256,
+	/// Nodes that have confirmed version ownership.
+	pub version_holders: BTreeSet<MessageNodeId>,
 	/// Master node.
 	pub master_node_id: MessageNodeId,
 	/// Consensus group to use in ShareAdd session.
@@ -936,7 +940,7 @@ pub struct ServersSetChangeError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// When servers set change session is completed.
@@ -999,7 +1003,7 @@ pub struct ShareAddError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
 }
 
 /// Key versions are requested.
@@ -1038,7 +1042,17 @@ pub struct KeyVersionsError {
 	/// Session-level nonce.
 	pub session_nonce: u64,
 	/// Error message.
-	pub error: String,
+	pub error: Error,
+	/// Continue action from failed node (if any). This field is oly filled
+	/// when error has occured when trying to compute result on master node.
+	pub continue_with: Option<FailedKeyVersionContinueAction>,
+}
+
+/// Key version continue action from failed node.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum FailedKeyVersionContinueAction {
+	/// Decryption session: origin + requester.
+	Decrypt(Option<SerializableAddress>, SerializableAddress),
 }
 
 impl Message {
@@ -1059,6 +1073,7 @@ impl Message {
 				_ => false
 			},
 			Message::KeyVersionNegotiation(KeyVersionNegotiationMessage::RequestKeyVersions(_)) => true,
+			Message::KeyVersionNegotiation(KeyVersionNegotiationMessage::KeyVersionsError(ref msg)) if msg.continue_with.is_some() => true,
 			Message::ShareAdd(ShareAddMessage::ShareAddConsensusMessage(ref msg)) => match msg.message {
 				ConsensusMessageOfShareAdd::InitializeConsensusSession(_) => true,
 				_ => false

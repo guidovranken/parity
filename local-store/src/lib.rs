@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 use std::fmt;
+use std::time::Duration;
 
 use transaction::{
 	SignedTransaction, PendingTransaction, UnverifiedTransaction,
@@ -25,7 +26,7 @@ use transaction::{
 };
 use ethcore::client::ClientIoMessage;
 use io::IoHandler;
-use rlp::UntrustedRlp;
+use rlp::Rlp;
 use kvdb::KeyValueDB;
 
 extern crate ethcore;
@@ -50,13 +51,13 @@ extern crate kvdb_memorydb;
 const LOCAL_TRANSACTIONS_KEY: &'static [u8] = &*b"LOCAL_TXS";
 
 const UPDATE_TIMER: ::io::TimerToken = 0;
-const UPDATE_TIMEOUT_MS: u64 = 15 * 60 * 1000; // once every 15 minutes.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60); // once every 15 minutes.
 
 /// Errors which can occur while using the local data store.
 #[derive(Debug)]
 pub enum Error {
-	/// Database errors: these manifest as `String`s.
-	Database(kvdb::Error),
+	/// Io and database errors: these manifest as `String`s.
+	Io(::std::io::Error),
 	/// JSON errors.
 	Json(::serde_json::Error),
 }
@@ -64,7 +65,7 @@ pub enum Error {
 impl fmt::Display for Error {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match *self {
-			Error::Database(ref val) => write!(f, "{}", val),
+			Error::Io(ref val) => write!(f, "{}", val),
 			Error::Json(ref err) => write!(f, "{}", err),
 		}
 	}
@@ -102,7 +103,7 @@ struct TransactionEntry {
 
 impl TransactionEntry {
 	fn into_pending(self) -> Option<PendingTransaction> {
-		let tx: UnverifiedTransaction = match UntrustedRlp::new(&self.rlp_bytes).as_val() {
+		let tx: UnverifiedTransaction = match Rlp::new(&self.rlp_bytes).as_val() {
 			Err(e) => {
 				warn!(target: "local_store", "Invalid persistent transaction stored: {}", e);
 				return None
@@ -159,7 +160,7 @@ pub struct LocalDataStore<T: NodeInfo> {
 impl<T: NodeInfo> LocalDataStore<T> {
 	/// Attempt to read pending transactions out of the local store.
 	pub fn pending_transactions(&self) -> Result<Vec<PendingTransaction>, Error> {
-		if let Some(val) = self.db.get(self.col, LOCAL_TRANSACTIONS_KEY).map_err(Error::Database)? {
+		if let Some(val) = self.db.get(self.col, LOCAL_TRANSACTIONS_KEY).map_err(Error::Io)? {
 			let local_txs: Vec<_> = ::serde_json::from_slice::<Vec<TransactionEntry>>(&val)
 				.map_err(Error::Json)?
 				.into_iter()
@@ -199,13 +200,13 @@ impl<T: NodeInfo> LocalDataStore<T> {
 		let json_str = format!("{}", local_json);
 
 		batch.put_vec(self.col, LOCAL_TRANSACTIONS_KEY, json_str.into_bytes());
-		self.db.write(batch).map_err(Error::Database)
+		self.db.write(batch).map_err(Error::Io)
 	}
 }
 
 impl<T: NodeInfo> IoHandler<ClientIoMessage> for LocalDataStore<T> {
 	fn initialize(&self, io: &::io::IoContext<ClientIoMessage>) {
-		if let Err(e) = io.register_timer(UPDATE_TIMER, UPDATE_TIMEOUT_MS) {
+		if let Err(e) = io.register_timer(UPDATE_TIMER, UPDATE_TIMEOUT) {
 			warn!(target: "local_store", "Error registering local store update timer: {}", e);
 		}
 	}

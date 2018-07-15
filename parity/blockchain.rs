@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -25,20 +25,20 @@ use hash::{keccak, KECCAK_NULL_RLP};
 use ethereum_types::{U256, H256, Address};
 use bytes::ToPretty;
 use rlp::PayloadInfo;
+use ethcore::account_provider::AccountProvider;
 use ethcore::client::{Mode, DatabaseCompactionProfile, VMType, BlockImportError, Nonce, Balance, BlockChainClient, BlockId, BlockInfo, ImportBlock};
-use ethcore::db::NUM_COLUMNS;
-use ethcore::error::ImportError;
+use ethcore::error::{ImportErrorKind, BlockImportErrorKind};
 use ethcore::miner::Miner;
 use ethcore::verification::queue::VerifierSettings;
 use ethcore_service::ClientService;
 use cache::CacheConfig;
 use informant::{Informant, FullNodeInformantData, MillisecondDuration};
-use kvdb_rocksdb::{Database, DatabaseConfig};
 use params::{SpecType, Pruning, Switch, tracing_switch_to_bool, fatdb_switch_to_bool};
 use helpers::{to_client_config, execute_upgrades};
 use dir::Directories;
 use user_defaults::UserDefaults;
-use fdlimit;
+use ethcore_private_tx;
+use db;
 
 #[derive(Debug, PartialEq)]
 pub enum DataFormat {
@@ -90,7 +90,6 @@ pub struct ImportBlockchain {
 	pub pruning_history: u64,
 	pub pruning_memory: usize,
 	pub compaction: DatabaseCompactionProfile,
-	pub wal: bool,
 	pub tracing: Switch,
 	pub fat_db: Switch,
 	pub vm_type: VMType,
@@ -111,7 +110,6 @@ pub struct ExportBlockchain {
 	pub pruning_history: u64,
 	pub pruning_memory: usize,
 	pub compaction: DatabaseCompactionProfile,
-	pub wal: bool,
 	pub fat_db: Switch,
 	pub tracing: Switch,
 	pub from_block: BlockId,
@@ -130,7 +128,6 @@ pub struct ExportState {
 	pub pruning_history: u64,
 	pub pruning_memory: usize,
 	pub compaction: DatabaseCompactionProfile,
-	pub wal: bool,
 	pub fat_db: Switch,
 	pub tracing: Switch,
 	pub at: BlockId,
@@ -177,8 +174,6 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	// load user defaults
 	let user_defaults = UserDefaults::load(&user_defaults_path)?;
 
-	fdlimit::raise_fd_limit();
-
 	// select pruning algorithm
 	let algorithm = cmd.pruning.to_algorithm(&user_defaults);
 
@@ -186,11 +181,10 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	let client_path = db_dirs.client_path(algorithm);
 
 	// execute upgrades
-	let compaction = cmd.compaction.compaction_profile(db_dirs.db_root_path().as_path());
-	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, compaction)?;
+	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, &cmd.compaction)?;
 
 	// create dirs used by parity
-	cmd.dirs.create_dirs(false, false, false)?;
+	cmd.dirs.create_dirs(false, false)?;
 
 	let cache = Arc::new(Mutex::new(
 		LightDataCache::new(Default::default(), Duration::new(0, 0))
@@ -208,19 +202,9 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	config.queue.verifier_settings = cmd.verifier_settings;
 
 	// initialize database.
-	let db = {
-		let db_config = DatabaseConfig {
-			memory_budget: Some(cmd.cache_config.blockchain() as usize * 1024 * 1024),
-			compaction: compaction,
-			wal: cmd.wal,
-			.. DatabaseConfig::with_columns(NUM_COLUMNS)
-		};
-
-		Arc::new(Database::open(
-			&db_config,
-			&client_path.to_str().expect("DB path could not be converted to string.")
-		).map_err(|e| format!("Failed to open database: {}", e))?)
-	};
+	let db = db::open_db(&client_path.to_str().expect("DB path could not be converted to string."),
+						 &cmd.cache_config,
+						 &cmd.compaction).map_err(|e| format!("Failed to open database: {:?}", e))?;
 
 	// TODO: could epoch signals be avilable at the end of the file?
 	let fetch = ::light::client::fetch::unavailable();
@@ -256,7 +240,7 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 	let do_import = |bytes: Vec<u8>| {
 		while client.queue_info().is_full() { sleep(Duration::from_secs(1)); }
 
-		let header: ::ethcore::header::Header = ::rlp::UntrustedRlp::new(&bytes).val_at(0)
+		let header: ::ethcore::header::Header = ::rlp::Rlp::new(&bytes).val_at(0)
 			.map_err(|e| format!("Bad block: {}", e))?;
 
 		if client.best_block_header().number() >= header.number() { return Ok(()) }
@@ -266,7 +250,7 @@ fn execute_import_light(cmd: ImportBlockchain) -> Result<(), String> {
 		}
 
 		match client.import_header(header) {
-			Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
+			Err(BlockImportError(BlockImportErrorKind::Import(ImportErrorKind::AlreadyInChain), _)) => {
 				trace!("Skipping block already in chain.");
 			}
 			Err(e) => {
@@ -336,8 +320,6 @@ fn execute_import(cmd: ImportBlockchain) -> Result<(), String> {
 	// load user defaults
 	let mut user_defaults = UserDefaults::load(&user_defaults_path)?;
 
-	fdlimit::raise_fd_limit();
-
 	// select pruning algorithm
 	let algorithm = cmd.pruning.to_algorithm(&user_defaults);
 
@@ -352,10 +334,10 @@ fn execute_import(cmd: ImportBlockchain) -> Result<(), String> {
 	let snapshot_path = db_dirs.snapshot_path();
 
 	// execute upgrades
-	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, cmd.compaction.compaction_profile(db_dirs.db_root_path().as_path()))?;
+	execute_upgrades(&cmd.dirs.base, &db_dirs, algorithm, &cmd.compaction)?;
 
 	// create dirs used by parity
-	cmd.dirs.create_dirs(false, false, false)?;
+	cmd.dirs.create_dirs(false, false)?;
 
 	// prepare client config
 	let mut client_config = to_client_config(
@@ -365,25 +347,34 @@ fn execute_import(cmd: ImportBlockchain) -> Result<(), String> {
 		tracing,
 		fat_db,
 		cmd.compaction,
-		cmd.wal,
 		cmd.vm_type,
 		"".into(),
 		algorithm,
 		cmd.pruning_history,
 		cmd.pruning_memory,
-		cmd.check_seal
+		cmd.check_seal,
 	);
 
 	client_config.queue.verifier_settings = cmd.verifier_settings;
+
+	let restoration_db_handler = db::restoration_db_handler(&client_path, &client_config);
+	let client_db = restoration_db_handler.open(&client_path)
+		.map_err(|e| format!("Failed to open database {:?}", e))?;
 
 	// build client
 	let service = ClientService::start(
 		client_config,
 		&spec,
-		&client_path,
+		client_db,
 		&snapshot_path,
+		restoration_db_handler,
 		&cmd.dirs.ipc_path(),
-		Arc::new(Miner::with_spec(&spec)),
+		// TODO [ToDr] don't use test miner here
+		// (actually don't require miner at all)
+		Arc::new(Miner::new_for_tests(&spec, None)),
+		Arc::new(AccountProvider::transient_provider()),
+		Box::new(ethcore_private_tx::NoopEncryptor),
+		Default::default(),
 	).map_err(|e| format!("Client service error: {:?}", e))?;
 
 	// free up the spec in memory.
@@ -428,7 +419,7 @@ fn execute_import(cmd: ImportBlockchain) -> Result<(), String> {
 	let do_import = |bytes| {
 		while client.queue_info().is_full() { sleep(Duration::from_secs(1)); }
 		match client.import_block(bytes) {
-			Err(BlockImportError::Import(ImportError::AlreadyInChain)) => {
+			Err(BlockImportError(BlockImportErrorKind::Import(ImportErrorKind::AlreadyInChain), _)) => {
 				trace!("Skipping block already in chain.");
 			}
 			Err(e) => {
@@ -498,7 +489,6 @@ fn start_client(
 	tracing: Switch,
 	fat_db: Switch,
 	compaction: DatabaseCompactionProfile,
-	wal: bool,
 	cache_config: CacheConfig,
 	require_fat_db: bool,
 ) -> Result<ClientService, String> {
@@ -518,8 +508,6 @@ fn start_client(
 	// load user defaults
 	let user_defaults = UserDefaults::load(&user_defaults_path)?;
 
-	fdlimit::raise_fd_limit();
-
 	// select pruning algorithm
 	let algorithm = pruning.to_algorithm(&user_defaults);
 
@@ -537,10 +525,10 @@ fn start_client(
 	let snapshot_path = db_dirs.snapshot_path();
 
 	// execute upgrades
-	execute_upgrades(&dirs.base, &db_dirs, algorithm, compaction.compaction_profile(db_dirs.db_root_path().as_path()))?;
+	execute_upgrades(&dirs.base, &db_dirs, algorithm, &compaction)?;
 
 	// create dirs used by parity
-	dirs.create_dirs(false, false, false)?;
+	dirs.create_dirs(false, false)?;
 
 	// prepare client config
 	let client_config = to_client_config(
@@ -550,7 +538,6 @@ fn start_client(
 		tracing,
 		fat_db,
 		compaction,
-		wal,
 		VMType::default(),
 		"".into(),
 		algorithm,
@@ -559,13 +546,23 @@ fn start_client(
 		true,
 	);
 
+	let restoration_db_handler = db::restoration_db_handler(&client_path, &client_config);
+	let client_db = restoration_db_handler.open(&client_path)
+		.map_err(|e| format!("Failed to open database {:?}", e))?;
+
 	let service = ClientService::start(
 		client_config,
 		&spec,
-		&client_path,
+		client_db,
 		&snapshot_path,
+		restoration_db_handler,
 		&dirs.ipc_path(),
-		Arc::new(Miner::with_spec(&spec)),
+		// It's fine to use test version here,
+		// since we don't care about miner parameters at all
+		Arc::new(Miner::new_for_tests(&spec, None)),
+		Arc::new(AccountProvider::transient_provider()),
+		Box::new(ethcore_private_tx::NoopEncryptor),
+		Default::default(),
 	).map_err(|e| format!("Client service error: {:?}", e))?;
 
 	drop(spec);
@@ -582,7 +579,6 @@ fn execute_export(cmd: ExportBlockchain) -> Result<(), String> {
 		cmd.tracing,
 		cmd.fat_db,
 		cmd.compaction,
-		cmd.wal,
 		cmd.cache_config,
 		false,
 	)?;
@@ -627,7 +623,6 @@ fn execute_export_state(cmd: ExportState) -> Result<(), String> {
 		cmd.tracing,
 		cmd.fat_db,
 		cmd.compaction,
-		cmd.wal,
 		cmd.cache_config,
 		true
 	)?;

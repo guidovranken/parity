@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -141,9 +141,15 @@ build_rpc_trait! {
 
 		/// Returns all pending transactions from transaction queue.
 		#[rpc(name = "parity_pendingTransactions")]
-		fn pending_transactions(&self) -> Result<Vec<Transaction>>;
+		fn pending_transactions(&self, Trailing<usize>) -> Result<Vec<Transaction>>;
 
-		/// Returns all future transactions from transaction queue.
+		/// Returns all transactions from transaction queue.
+		///
+		/// Some of them might not be ready to be included in a block yet.
+		#[rpc(name = "parity_allTransactions")]
+		fn all_transactions(&self) -> Result<Vec<Transaction>>;
+
+		/// Returns all future transactions from transaction queue (deprecated)
 		#[rpc(name = "parity_futureTransactions")]
 		fn future_transactions(&self) -> Result<Vec<Transaction>>;
 
@@ -156,6 +162,7 @@ build_rpc_trait! {
 		fn local_transactions(&self) -> Result<BTreeMap<H256, LocalTransactionStatus>>;
 
 		/// Returns current Dapps Server interface and port or an error if dapps server is disabled.
+		/// (deprecated, should always return an error now).
 		#[rpc(name = "parity_dappsUrl")]
 		fn dapps_url(&self) -> Result<String>;
 
@@ -172,7 +179,7 @@ build_rpc_trait! {
 		fn mode(&self) -> Result<String>;
 
 		/// Returns the chain ID used for transaction signing at the
-		/// current best block. An empty string is returned if not
+		/// current best block. None is returned if not
 		/// available.
 		#[rpc(name = "parity_chainId")]
 		fn chain_id(&self) -> Result<Option<U64>>;

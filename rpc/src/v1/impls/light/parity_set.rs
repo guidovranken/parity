@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -20,14 +20,13 @@
 use std::io;
 use std::sync::Arc;
 
-use ethsync::ManageNetwork;
+use sync::ManageNetwork;
 use fetch::{self, Fetch};
 use futures_cpupool::CpuPool;
 use hash::keccak_buffer;
 
 use jsonrpc_core::{Result, BoxFuture};
 use jsonrpc_core::futures::Future;
-use v1::helpers::dapps::DappsService;
 use v1::helpers::errors;
 use v1::traits::ParitySet;
 use v1::types::{Bytes, H160, H256, U256, ReleaseInfo, Transaction, LocalDapp};
@@ -35,17 +34,15 @@ use v1::types::{Bytes, H160, H256, U256, ReleaseInfo, Transaction, LocalDapp};
 /// Parity-specific rpc interface for operations altering the settings.
 pub struct ParitySetClient<F> {
 	net: Arc<ManageNetwork>,
-	dapps: Option<Arc<DappsService>>,
 	fetch: F,
 	pool: CpuPool,
 }
 
 impl<F: Fetch> ParitySetClient<F> {
 	/// Creates new `ParitySetClient` with given `Fetch`.
-	pub fn new(net: Arc<ManageNetwork>, dapps: Option<Arc<DappsService>>, fetch: F, p: CpuPool) -> Self {
+	pub fn new(net: Arc<ManageNetwork>, fetch: F, p: CpuPool) -> Self {
 		ParitySetClient {
 			net: net,
-			dapps: dapps,
 			fetch: fetch,
 			pool: p,
 		}
@@ -128,7 +125,7 @@ impl<F: Fetch> ParitySet for ParitySetClient<F> {
 	}
 
 	fn hash_content(&self, url: String) -> BoxFuture<H256> {
-		let future = self.fetch.fetch(&url, Default::default()).then(move |result| {
+		let future = self.fetch.get(&url, Default::default()).then(move |result| {
 			result
 				.map_err(errors::fetch)
 				.and_then(move |response| {
@@ -141,11 +138,11 @@ impl<F: Fetch> ParitySet for ParitySetClient<F> {
 	}
 
 	fn dapps_refresh(&self) -> Result<bool> {
-		self.dapps.as_ref().map(|dapps| dapps.refresh_local_dapps()).ok_or_else(errors::dapps_disabled)
+		Err(errors::dapps_disabled())
 	}
 
 	fn dapps_list(&self) -> Result<Vec<LocalDapp>> {
-		self.dapps.as_ref().map(|dapps| dapps.list_dapps()).ok_or_else(errors::dapps_disabled)
+		Err(errors::dapps_disabled())
 	}
 
 	fn upgrade_ready(&self) -> Result<Option<ReleaseInfo>> {

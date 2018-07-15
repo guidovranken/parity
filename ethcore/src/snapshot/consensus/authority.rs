@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,7 +24,7 @@ use super::{SnapshotComponents, Rebuilder, ChunkSink};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use blockchain::{BlockChain, BlockProvider};
+use blockchain::{BlockChain, BlockChainDB, BlockProvider};
 use engines::{EthEngine, EpochVerifier, EpochTransition};
 use machine::EthereumMachine;
 use ids::BlockId;
@@ -33,10 +33,11 @@ use receipt::Receipt;
 use snapshot::{Error, ManifestData};
 
 use itertools::{Position, Itertools};
-use rlp::{RlpStream, UntrustedRlp};
+use rlp::{RlpStream, Rlp};
 use ethereum_types::{H256, U256};
 use kvdb::KeyValueDB;
 use bytes::Bytes;
+
 
 /// Snapshot creation and restoration for PoA chains.
 /// Chunk format:
@@ -100,7 +101,7 @@ impl SnapshotComponents for PoaSnapshot {
 		let (block, receipts) = chain.block(&block_at)
 			.and_then(|b| chain.block_receipts(&block_at).map(|r| (b, r)))
 			.ok_or(Error::BlockNotFound(block_at))?;
-		let block = block.decode();
+		let block = block.decode()?;
 
 		let parent_td = chain.block_details(block.header.parent_hash())
 			.map(|d| d.total_difficulty)
@@ -125,14 +126,14 @@ impl SnapshotComponents for PoaSnapshot {
 	fn rebuilder(
 		&self,
 		chain: BlockChain,
-		db: Arc<KeyValueDB>,
+		db: Arc<BlockChainDB>,
 		manifest: &ManifestData,
 	) -> Result<Box<Rebuilder>, ::error::Error> {
 		Ok(Box::new(ChunkRebuilder {
 			manifest: manifest.clone(),
 			warp_target: None,
 			chain: chain,
-			db: db,
+			db: db.key_value().clone(),
 			had_genesis: false,
 			unverified_firsts: Vec::new(),
 			last_epochs: Vec::new(),
@@ -182,7 +183,7 @@ impl ChunkRebuilder {
 	fn verify_transition(
 		&mut self,
 		last_verifier: &mut Option<Box<EpochVerifier<EthereumMachine>>>,
-		transition_rlp: UntrustedRlp,
+		transition_rlp: Rlp,
 		engine: &EthEngine,
 	) -> Result<Verified, ::error::Error> {
 		use engines::ConstructedVerifier;
@@ -242,7 +243,7 @@ impl Rebuilder for ChunkRebuilder {
 		engine: &EthEngine,
 		abort_flag: &AtomicBool,
 	) -> Result<(), ::error::Error> {
-		let rlp = UntrustedRlp::new(chunk);
+		let rlp = Rlp::new(chunk);
 		let is_last_chunk: bool = rlp.val_at(0)?;
 		let num_items = rlp.item_count()?;
 

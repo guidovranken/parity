@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,22 +17,23 @@
 extern crate byteorder;
 extern crate ethabi;
 extern crate ethcore;
-extern crate ethcore_bytes as bytes;
+extern crate parity_bytes as bytes;
+extern crate parity_crypto as crypto;
 extern crate ethcore_logger as logger;
-extern crate ethcrypto;
+extern crate ethcore_sync as sync;
+extern crate ethcore_transaction as transaction;
 extern crate ethereum_types;
 extern crate ethkey;
-extern crate ethsync;
 extern crate futures_cpupool;
 extern crate hyper;
 extern crate keccak_hash as hash;
 extern crate kvdb;
-extern crate kvdb_rocksdb;
 extern crate parking_lot;
 extern crate rustc_hex;
 extern crate serde;
 extern crate serde_json;
 extern crate tiny_keccak;
+extern crate tokio;
 extern crate tokio_core;
 extern crate tokio_io;
 extern crate tokio_proto;
@@ -52,8 +53,12 @@ extern crate lazy_static;
 #[macro_use]
 extern crate log;
 
+#[cfg(test)]
+extern crate kvdb_rocksdb;
+
 mod key_server_cluster;
 mod types;
+mod helpers;
 
 mod traits;
 mod acl_storage;
@@ -66,26 +71,27 @@ mod listener;
 mod trusted_client;
 
 use std::sync::Arc;
+use kvdb::KeyValueDB;
 use ethcore::client::Client;
-use ethsync::SyncProvider;
+use ethcore::miner::Miner;
+use sync::SyncProvider;
 
-pub use types::all::{ServerKeyId, EncryptedDocumentKey, RequestSignature, Public,
+pub use types::{ServerKeyId, EncryptedDocumentKey, RequestSignature, Public,
 	Error, NodeAddress, ContractAddress, ServiceConfiguration, ClusterConfiguration};
 pub use traits::{NodeKeyPair, KeyServer};
 pub use self::node_key_pair::{PlainNodeKeyPair, KeyStoreNodeKeyPair};
 
 /// Start new key server instance
-pub fn start(client: Arc<Client>, sync: Arc<SyncProvider>, self_key_pair: Arc<NodeKeyPair>, config: ServiceConfiguration) -> Result<Box<KeyServer>, Error> {
-	let trusted_client = trusted_client::TrustedClient::new(client.clone(), sync);
-	let acl_storage: Arc<acl_storage::AclStorage> = if config.acl_check_enabled {
-			acl_storage::OnChainAclStorage::new(trusted_client.clone())?
-		} else {
-			Arc::new(acl_storage::DummyAclStorage::default())
-		};
+pub fn start(client: Arc<Client>, sync: Arc<SyncProvider>, miner: Arc<Miner>, self_key_pair: Arc<NodeKeyPair>, mut config: ServiceConfiguration, db: Arc<KeyValueDB>) -> Result<Box<KeyServer>, Error> {
+	let trusted_client = trusted_client::TrustedClient::new(self_key_pair.clone(), client.clone(), sync, miner);
+	let acl_storage: Arc<acl_storage::AclStorage> = match config.acl_check_contract_address.take() {
+		Some(acl_check_contract_address) => acl_storage::OnChainAclStorage::new(trusted_client.clone(), acl_check_contract_address)?,
+		None => Arc::new(acl_storage::DummyAclStorage::default()),
+	};
 
-	let key_server_set = key_server_set::OnChainKeyServerSet::new(trusted_client.clone(), self_key_pair.clone(),
-		config.cluster_config.auto_migrate_enabled, config.cluster_config.nodes.clone())?;
-	let key_storage = Arc::new(key_storage::PersistentKeyStorage::new(&config)?);
+	let key_server_set = key_server_set::OnChainKeyServerSet::new(trusted_client.clone(), config.cluster_config.key_server_set_contract_address.take(),
+		self_key_pair.clone(), config.cluster_config.auto_migrate_enabled, config.cluster_config.nodes.clone())?;
+	let key_storage = Arc::new(key_storage::PersistentKeyStorage::new(db)?);
 	let key_server = Arc::new(key_server::KeyServerImpl::new(&config.cluster_config, key_server_set.clone(), self_key_pair.clone(), acl_storage.clone(), key_storage.clone())?);
 	let cluster = key_server.cluster();
 	let key_server: Arc<KeyServer> = key_server;

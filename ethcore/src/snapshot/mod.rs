@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -32,14 +32,16 @@ use ids::BlockId;
 
 use ethereum_types::{H256, U256};
 use hashdb::HashDB;
+use keccak_hasher::KeccakHasher;
 use kvdb::DBValue;
 use snappy;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use journaldb::{self, Algorithm, JournalDB};
 use kvdb::KeyValueDB;
-use trie::{TrieDB, TrieDBMut, Trie, TrieMut};
-use rlp::{RlpStream, UntrustedRlp};
+use trie::{Trie, TrieMut};
+use ethtrie::{TrieDB, TrieDBMut};
+use rlp::{RlpStream, Rlp};
 use bloom_journal::Bloom;
 
 use self::io::SnapshotWriter;
@@ -126,7 +128,7 @@ pub fn take_snapshot<W: SnapshotWriter + Send>(
 	engine: &EthEngine,
 	chain: &BlockChain,
 	block_at: H256,
-	state_db: &HashDB,
+	state_db: &HashDB<KeccakHasher>,
 	writer: W,
 	p: &Progress
 ) -> Result<(), Error> {
@@ -264,7 +266,7 @@ impl<'a> StateChunker<'a> {
 ///
 /// Returns a list of hashes of chunks created, or any error it may
 /// have encountered.
-pub fn chunk_state<'a>(db: &HashDB, root: &H256, writer: &Mutex<SnapshotWriter + 'a>, progress: &'a Progress) -> Result<Vec<H256>, Error> {
+pub fn chunk_state<'a>(db: &HashDB<KeccakHasher>, root: &H256, writer: &Mutex<SnapshotWriter + 'a>, progress: &'a Progress) -> Result<Vec<H256>, Error> {
 	let account_trie = TrieDB::new(db, &root)?;
 
 	let mut chunker = StateChunker {
@@ -281,7 +283,7 @@ pub fn chunk_state<'a>(db: &HashDB, root: &H256, writer: &Mutex<SnapshotWriter +
 	// account_key here is the address' hash.
 	for item in account_trie.iter()? {
 		let (account_key, account_data) = item?;
-		let account = ::rlp::decode(&*account_data);
+		let account = ::rlp::decode(&*account_data)?;
 		let account_key_hash = H256::from_slice(&account_key);
 
 		let account_db = AccountDB::from_hash(db, account_key_hash);
@@ -327,7 +329,7 @@ impl StateRebuilder {
 
 	/// Feed an uncompressed state chunk into the rebuilder.
 	pub fn feed(&mut self, chunk: &[u8], flag: &AtomicBool) -> Result<(), ::error::Error> {
-		let rlp = UntrustedRlp::new(chunk);
+		let rlp = Rlp::new(chunk);
 		let empty_rlp = StateAccount::new_basic(U256::zero(), U256::zero()).rlp();
 		let mut pairs = Vec::with_capacity(rlp.item_count()?);
 
@@ -414,8 +416,8 @@ struct RebuiltStatus {
 // rebuild a set of accounts and their storage.
 // returns a status detailing newly-loaded code and accounts missing code.
 fn rebuild_accounts(
-	db: &mut HashDB,
-	account_fat_rlps: UntrustedRlp,
+	db: &mut HashDB<KeccakHasher>,
+	account_fat_rlps: Rlp,
 	out_chunk: &mut [(H256, Bytes)],
 	known_code: &HashMap<H256, H256>,
 	known_storage_roots: &mut HashMap<H256, H256>,
@@ -467,10 +469,10 @@ fn rebuild_accounts(
 		*out = (hash, thin_rlp);
 	}
 	if let Some(&(ref hash, ref rlp)) = out_chunk.iter().last() {
-		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp).storage_root);
+		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp)?.storage_root);
 	}
 	if let Some(&(ref hash, ref rlp)) = out_chunk.iter().next() {
-		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp).storage_root);
+		known_storage_roots.insert(*hash, ::rlp::decode::<BasicAccount>(rlp)?.storage_root);
 	}
 	Ok(status)
 }
@@ -487,7 +489,7 @@ pub fn verify_old_block(rng: &mut OsRng, header: &Header, engine: &EthEngine, ch
 	if always || rng.gen::<f32>() <= POW_VERIFY_RATE {
 		engine.verify_block_unordered(header)?;
 		match chain.block_header_data(header.parent_hash()) {
-			Some(parent) => engine.verify_block_family(header, &parent.decode()),
+			Some(parent) => engine.verify_block_family(header, &parent.decode()?),
 			None => Ok(()),
 		}
 	} else {

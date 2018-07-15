@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -95,11 +95,12 @@ build_rpc_trait! {
 		#[rpc(name = "parity_hashContent")]
 		fn hash_content(&self, String) -> BoxFuture<H256>;
 
-		/// Returns true if refresh successful, error if unsuccessful or server is disabled.
+		/// Returns true if refresh successful, error if unsuccessful or server is disabled
+		/// (deprecated, should always return an error now).
 		#[rpc(name = "parity_dappsRefresh")]
 		fn dapps_refresh(&self) -> Result<bool>;
 
-		/// Returns a list of local dapps
+		/// Returns a list of local dapps (deprecated, should always return an error now).
 		#[rpc(name = "parity_dappsList")]
 		fn dapps_list(&self) -> Result<Vec<LocalDapp>>;
 

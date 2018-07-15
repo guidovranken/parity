@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,11 +21,13 @@ use std::sync::Arc;
 use std::collections::{HashMap, BTreeMap};
 use hash::{KECCAK_EMPTY, KECCAK_NULL_RLP, keccak};
 use ethereum_types::{H256, U256, Address};
+use error::Error;
 use hashdb::HashDB;
+use keccak_hasher::KeccakHasher;
 use kvdb::DBValue;
 use bytes::{Bytes, ToPretty};
-use trie;
-use trie::{SecTrieDB, Trie, TrieFactory, TrieError};
+use trie::{Trie, Recorder};
+use ethtrie::{TrieFactory, TrieDB, SecTrieDB, Result as TrieResult};
 use pod_account::*;
 use rlp::{RlpStream, encode};
 use lru_cache::LruCache;
@@ -144,9 +146,10 @@ impl Account {
 	}
 
 	/// Create a new account from RLP.
-	pub fn from_rlp(rlp: &[u8]) -> Account {
-		let basic: BasicAccount = ::rlp::decode(rlp);
-		basic.into()
+	pub fn from_rlp(rlp: &[u8]) -> Result<Account, Error> {
+		::rlp::decode::<BasicAccount>(rlp)
+			.map(|ba| ba.into())
+			.map_err(|e| e.into())
 	}
 
 	/// Create a new contract account.
@@ -180,6 +183,16 @@ impl Account {
 		self.init_code(code);
 	}
 
+	/// Reset this account's code and storage to given values.
+	pub fn reset_code_and_storage(&mut self, code: Arc<Bytes>, storage: HashMap<H256, H256>) {
+		self.code_hash = keccak(&*code);
+		self.code_cache = code;
+		self.code_size = Some(self.code_cache.len());
+		self.code_filth = Filth::Dirty;
+		self.storage_cache = Self::empty_storage_cache();
+		self.storage_changes = storage;
+	}
+
 	/// Set (and cache) the contents of the trie's storage at `key` to `value`.
 	pub fn set_storage(&mut self, key: H256, value: H256) {
 		self.storage_changes.insert(key, value);
@@ -187,13 +200,13 @@ impl Account {
 
 	/// Get (and cache) the contents of the trie's storage at `key`.
 	/// Takes modified storage into account.
-	pub fn storage_at(&self, db: &HashDB, key: &H256) -> trie::Result<H256> {
+	pub fn storage_at(&self, db: &HashDB<KeccakHasher>, key: &H256) -> TrieResult<H256> {
 		if let Some(value) = self.cached_storage_at(key) {
 			return Ok(value);
 		}
 		let db = SecTrieDB::new(db, &self.storage_root)?;
-
-		let item: U256 = db.get_with(key, ::rlp::decode)?.unwrap_or_else(U256::zero);
+		let panicky_decoder = |bytes:&[u8]| ::rlp::decode(&bytes).expect("decoding db value failed");
+		let item: U256 = db.get_with(key, panicky_decoder)?.unwrap_or_else(U256::zero);
 		let value: H256 = item.into();
 		self.storage_cache.borrow_mut().insert(key.clone(), value.clone());
 		Ok(value)
@@ -266,7 +279,7 @@ impl Account {
 	}
 
 	/// Provide a database to get `code_hash`. Should not be called if it is a contract without code.
-	pub fn cache_code(&mut self, db: &HashDB) -> Option<Arc<Bytes>> {
+	pub fn cache_code(&mut self, db: &HashDB<KeccakHasher>) -> Option<Arc<Bytes>> {
 		// TODO: fill out self.code_cache;
 		trace!("Account::cache_code: ic={}; self.code_hash={:?}, self.code_cache={}", self.is_cached(), self.code_hash, self.code_cache.pretty());
 
@@ -295,7 +308,7 @@ impl Account {
 	}
 
 	/// Provide a database to get `code_size`. Should not be called if it is a contract without code.
-	pub fn cache_code_size(&mut self, db: &HashDB) -> bool {
+	pub fn cache_code_size(&mut self, db: &HashDB<KeccakHasher>) -> bool {
 		// TODO: fill out self.code_cache;
 		trace!("Account::cache_code_size: ic={}; self.code_hash={:?}, self.code_cache={}", self.is_cached(), self.code_hash, self.code_cache.pretty());
 		self.code_size.is_some() ||
@@ -362,7 +375,7 @@ impl Account {
 	}
 
 	/// Commit the `storage_changes` to the backing DB and update `storage_root`.
-	pub fn commit_storage(&mut self, trie_factory: &TrieFactory, db: &mut HashDB) -> trie::Result<()> {
+	pub fn commit_storage(&mut self, trie_factory: &TrieFactory, db: &mut HashDB<KeccakHasher>) -> TrieResult<()> {
 		let mut t = trie_factory.from_existing(db, &mut self.storage_root)?;
 		for (k, v) in self.storage_changes.drain() {
 			// cast key and value to trait type,
@@ -378,7 +391,7 @@ impl Account {
 	}
 
 	/// Commit any unsaved code. `code_hash` will always return the hash of the `code_cache` after this.
-	pub fn commit_code(&mut self, db: &mut HashDB) {
+	pub fn commit_code(&mut self, db: &mut HashDB<KeccakHasher>) {
 		trace!("Commiting code of {:?} - {:?}, {:?}", self, self.code_filth == Filth::Dirty, self.code_cache.is_empty());
 		match (self.code_filth == Filth::Dirty, self.code_cache.is_empty()) {
 			(true, true) => {
@@ -424,7 +437,6 @@ impl Account {
 	pub fn clone_dirty(&self) -> Account {
 		let mut account = self.clone_basic();
 		account.storage_changes = self.storage_changes.clone();
-		account.code_cache = self.code_cache.clone();
 		account
 	}
 
@@ -449,7 +461,7 @@ impl Account {
 		self.address_hash = other.address_hash;
 		let mut cache = self.storage_cache.borrow_mut();
 		for (k, v) in other.storage_cache.into_inner() {
-			cache.insert(k.clone() , v.clone()); //TODO: cloning should not be required here
+			cache.insert(k, v);
 		}
 		self.storage_changes = other.storage_changes;
 	}
@@ -461,15 +473,13 @@ impl Account {
 	/// trie.
 	/// `storage_key` is the hash of the desired storage key, meaning
 	/// this will only work correctly under a secure trie.
-	pub fn prove_storage(&self, db: &HashDB, storage_key: H256) -> Result<(Vec<Bytes>, H256), Box<TrieError>> {
-		use trie::{Trie, TrieDB};
-		use trie::recorder::Recorder;
-
+	pub fn prove_storage(&self, db: &HashDB<KeccakHasher>, storage_key: H256) -> TrieResult<(Vec<Bytes>, H256)> {
 		let mut recorder = Recorder::new();
 
 		let trie = TrieDB::new(db, &self.storage_root)?;
 		let item: U256 = {
-			let query = (&mut recorder, ::rlp::decode);
+			let panicky_decoder = |bytes:&[u8]| ::rlp::decode(bytes).expect("decoding db value failed");
+			let query = (&mut recorder, panicky_decoder);
 			trie.get_with(&storage_key, query)?.unwrap_or_else(U256::zero)
 		};
 
@@ -519,7 +529,7 @@ mod tests {
 			a.rlp()
 		};
 
-		let a = Account::from_rlp(&rlp);
+		let a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert_eq!(*a.storage_root().unwrap(), "c57e1afb758b07f8d2c8f13a3b6e44fa5ff94ab266facc5a4fd3f062426e50b2".into());
 		assert_eq!(a.storage_at(&db.immutable(), &0x00u64.into()).unwrap(), 0x1234u64.into());
 		assert_eq!(a.storage_at(&db.immutable(), &0x01u64.into()).unwrap(), H256::default());
@@ -537,10 +547,10 @@ mod tests {
 			a.rlp()
 		};
 
-		let mut a = Account::from_rlp(&rlp);
+		let mut a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert!(a.cache_code(&db.immutable()).is_some());
 
-		let mut a = Account::from_rlp(&rlp);
+		let mut a = Account::from_rlp(&rlp).expect("decoding db value failed");
 		assert_eq!(a.note_code(vec![0x55, 0x44, 0xffu8]), Ok(()));
 	}
 
@@ -600,7 +610,7 @@ mod tests {
 	#[test]
 	fn rlpio() {
 		let a = Account::new(69u8.into(), 0u8.into(), HashMap::new(), Bytes::new());
-		let b = Account::from_rlp(&a.rlp());
+		let b = Account::from_rlp(&a.rlp()).unwrap();
 		assert_eq!(a.balance(), b.balance());
 		assert_eq!(a.nonce(), b.nonce());
 		assert_eq!(a.code_hash(), b.code_hash());

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,32 +16,32 @@
 
 //! A blockchain engine that supports a non-instant BFT proof-of-authority.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
+use std::iter::FromIterator;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Weak, Arc};
-use std::time::{UNIX_EPOCH, Duration};
-use std::collections::{BTreeMap, HashSet};
-use std::iter::FromIterator;
+use std::time::{UNIX_EPOCH, SystemTime, Duration};
 
 use account_provider::AccountProvider;
 use block::*;
 use client::EngineClient;
 use engines::{Engine, Seal, EngineError, ConstructedVerifier};
-use error::{Error, BlockError};
+use engines::block_reward;
+use engines::block_reward::{BlockRewardContract, RewardKind};
+use error::{Error, ErrorKind, BlockError};
 use ethjson;
 use machine::{AuxiliaryData, Call, EthereumMachine};
 use hash::keccak;
-use header::{Header, BlockNumber};
-
+use header::{Header, BlockNumber, ExtendedHeader};
 use super::signer::EngineSigner;
 use super::validator_set::{ValidatorSet, SimpleList, new_validator_set};
-
 use self::finality::RollingFinality;
-
-use ethkey::{public_to_address, recover, verify_address, Signature};
+use ethkey::{self, Password, Signature};
 use io::{IoContext, IoHandler, TimerToken, IoService};
 use itertools::{self, Itertools};
-use rlp::{encode, Decodable, DecoderError, Encodable, RlpStream, UntrustedRlp};
+use rlp::{encode, Decodable, DecoderError, Encodable, RlpStream, Rlp};
 use ethereum_types::{H256, H520, Address, U128, U256};
 use parking_lot::{Mutex, RwLock};
 use unexpected::{Mismatch, OutOfBounds};
@@ -68,6 +68,10 @@ pub struct AuthorityRoundParams {
 	pub immediate_transitions: bool,
 	/// Block reward in base units.
 	pub block_reward: U256,
+	/// Block reward contract transition block.
+	pub block_reward_contract_transition: u64,
+	/// Block reward contract.
+	pub block_reward_contract: Option<BlockRewardContract>,
 	/// Number of accepted uncles transition block.
 	pub maximum_uncle_count_transition: u64,
 	/// Number of accepted uncles.
@@ -95,6 +99,8 @@ impl From<ethjson::spec::AuthorityRoundParams> for AuthorityRoundParams {
 			validate_step_transition: p.validate_step_transition.map_or(0, Into::into),
 			immediate_transitions: p.immediate_transitions.unwrap_or(false),
 			block_reward: p.block_reward.map_or_else(Default::default, Into::into),
+			block_reward_contract_transition: p.block_reward_contract_transition.map_or(0, Into::into),
+			block_reward_contract: p.block_reward_contract_address.map(BlockRewardContract::new),
 			maximum_uncle_count_transition: p.maximum_uncle_count_transition.map_or(0, Into::into),
 			maximum_uncle_count: p.maximum_uncle_count.map_or(0, Into::into),
 			empty_steps_transition: p.empty_steps_transition.map_or(u64::max_value(), |n| ::std::cmp::max(n.into(), 1)),
@@ -292,14 +298,14 @@ impl EmptyStep {
 		let message = keccak(empty_step_rlp(self.step, &self.parent_hash));
 		let correct_proposer = step_proposer(validators, &self.parent_hash, self.step);
 
-		verify_address(&correct_proposer, &self.signature.into(), &message)
+		ethkey::verify_address(&correct_proposer, &self.signature.into(), &message)
 			.map_err(|e| e.into())
 	}
 
 	fn author(&self) -> Result<Address, Error> {
 		let message = keccak(empty_step_rlp(self.step, &self.parent_hash));
-		let public = recover(&self.signature.into(), &message)?;
-		Ok(public_to_address(&public))
+		let public = ethkey::recover(&self.signature.into(), &message)?;
+		Ok(ethkey::public_to_address(&public))
 	}
 
 	fn sealed(&self) -> SealedEmptyStep {
@@ -325,7 +331,7 @@ impl Encodable for EmptyStep {
 }
 
 impl Decodable for EmptyStep {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		let signature = rlp.val_at(0)?;
 		let empty_step_rlp = rlp.at(1)?;
 
@@ -366,7 +372,7 @@ impl Encodable for SealedEmptyStep {
 }
 
 impl Decodable for SealedEmptyStep {
-	fn decode(rlp: &UntrustedRlp) -> Result<Self, DecoderError> {
+	fn decode(rlp: &Rlp) -> Result<Self, DecoderError> {
 		let signature = rlp.val_at(0)?;
 		let step = rlp.val_at(1)?;
 
@@ -374,12 +380,16 @@ impl Decodable for SealedEmptyStep {
 	}
 }
 
+struct PermissionedStep {
+	inner: Step,
+	can_propose: AtomicBool,
+}
+
 /// Engine using `AuthorityRound` proof-of-authority BFT consensus.
 pub struct AuthorityRound {
 	transition_service: IoService<()>,
-	step: Arc<Step>,
-	can_propose: AtomicBool,
-	client: RwLock<Option<Weak<EngineClient>>>,
+	step: Arc<PermissionedStep>,
+	client: Arc<RwLock<Option<Weak<EngineClient>>>>,
 	signer: RwLock<EngineSigner>,
 	validators: Box<ValidatorSet>,
 	validate_score_transition: u64,
@@ -388,6 +398,8 @@ pub struct AuthorityRound {
 	epoch_manager: Mutex<EpochManager>,
 	immediate_transitions: bool,
 	block_reward: U256,
+	block_reward_contract_transition: u64,
+	block_reward_contract: Option<BlockRewardContract>,
 	maximum_uncle_count_transition: u64,
 	maximum_uncle_count: usize,
 	empty_steps_transition: u64,
@@ -397,7 +409,7 @@ pub struct AuthorityRound {
 
 // header-chain validator.
 struct EpochVerifier {
-	step: Arc<Step>,
+	step: Arc<PermissionedStep>,
 	subchain_validators: SimpleList,
 	empty_steps_transition: u64,
 }
@@ -405,7 +417,7 @@ struct EpochVerifier {
 impl super::EpochVerifier<EthereumMachine> for EpochVerifier {
 	fn verify_light(&self, header: &Header) -> Result<(), Error> {
 		// Validate the timestamp
-		verify_timestamp(&*self.step, header_step(header, self.empty_steps_transition)?)?;
+		verify_timestamp(&self.step.inner, header_step(header, self.empty_steps_transition)?)?;
 		// always check the seal since it's fast.
 		// nothing heavier to do.
 		verify_external(header, &self.subchain_validators, self.empty_steps_transition)
@@ -415,7 +427,7 @@ impl super::EpochVerifier<EthereumMachine> for EpochVerifier {
 		let mut finality_checker = RollingFinality::blank(self.subchain_validators.clone().into_inner());
 		let mut finalized = Vec::new();
 
-		let headers: Vec<Header> = UntrustedRlp::new(proof).as_list().ok()?;
+		let headers: Vec<Header> = Rlp::new(proof).as_list().ok()?;
 
 		{
 			let mut push_header = |parent_header: &Header, header: Option<&Header>| {
@@ -479,13 +491,13 @@ fn header_expected_seal_fields(header: &Header, empty_steps_transition: u64) -> 
 
 fn header_step(header: &Header, empty_steps_transition: u64) -> Result<usize, ::rlp::DecoderError> {
 	let expected_seal_fields = header_expected_seal_fields(header, empty_steps_transition);
-	UntrustedRlp::new(&header.seal().get(0).expect(
+	Rlp::new(&header.seal().get(0).expect(
 		&format!("was either checked with verify_block_basic or is genesis; has {} fields; qed (Make sure the spec file has a correct genesis seal)", expected_seal_fields))).as_val()
 }
 
 fn header_signature(header: &Header, empty_steps_transition: u64) -> Result<Signature, ::rlp::DecoderError> {
 	let expected_seal_fields = header_expected_seal_fields(header, empty_steps_transition);
-	UntrustedRlp::new(&header.seal().get(1).expect(
+	Rlp::new(&header.seal().get(1).expect(
 		&format!("was checked with verify_block_basic; has {} fields; qed", expected_seal_fields))).as_val::<H520>().map(Into::into)
 }
 
@@ -498,7 +510,7 @@ fn header_empty_steps_raw(header: &Header) -> &[u8] {
 // extracts the empty steps from the header seal. should only be called when there are 3 fields in the seal
 // (i.e. header.number() >= self.empty_steps_transition).
 fn header_empty_steps(header: &Header) -> Result<Vec<EmptyStep>, ::rlp::DecoderError> {
-	let empty_steps = UntrustedRlp::new(header_empty_steps_raw(header)).as_list::<SealedEmptyStep>()?;
+	let empty_steps = Rlp::new(header_empty_steps_raw(header)).as_list::<SealedEmptyStep>()?;
 	Ok(empty_steps.into_iter().map(|s| EmptyStep::from_sealed(s, header.parent_hash())).collect())
 }
 
@@ -536,6 +548,7 @@ fn verify_timestamp(step: &Step, header_step: usize) -> Result<(), BlockError> {
 			// NOTE This error might be returned only in early stage of verification (Stage 1).
 			// Returning it further won't recover the sync process.
 			trace!(target: "engine", "verify_timestamp: block too early");
+			let oob = oob.map(|n| SystemTime::now() + Duration::from_secs(n));
 			Err(BlockError::TemporarilyInvalid(oob).into())
 		},
 		Ok(_) => Ok(()),
@@ -555,12 +568,11 @@ fn verify_external(header: &Header, validators: &ValidatorSet, empty_steps_trans
 		};
 
 		let header_seal_hash = header_seal_hash(header, empty_steps_rlp);
-		!verify_address(&correct_proposer, &proposer_signature, &header_seal_hash)?
+		!ethkey::verify_address(&correct_proposer, &proposer_signature, &header_seal_hash)?
 	};
 
 	if is_invalid_proposer {
 		trace!(target: "engine", "verify_block_external: bad proposer for step: {}", header_step);
-		validators.report_benign(header.author(), header.number(), header.number());
 		Err(EngineError::NotProposer(Mismatch { expected: correct_proposer, found: header.author().clone() }))?
 	} else {
 		Ok(())
@@ -574,7 +586,7 @@ fn combine_proofs(signal_number: BlockNumber, set_proof: &[u8], finality_proof: 
 }
 
 fn destructure_proofs(combined: &[u8]) -> Result<(BlockNumber, &[u8], &[u8]), Error> {
-	let rlp = UntrustedRlp::new(combined);
+	let rlp = Rlp::new(combined);
 	Ok((
 		rlp.at(0)?.as_val()?,
 		rlp.at(1)?.data()?,
@@ -592,6 +604,23 @@ impl AsMillis for Duration {
 	}
 }
 
+// A type for storing owned or borrowed data that has a common type.
+// Useful for returning either a borrow or owned data from a function.
+enum CowLike<'a, A: 'a + ?Sized, B> {
+	Borrowed(&'a A),
+	Owned(B),
+}
+
+impl<'a, A: ?Sized, B> Deref for CowLike<'a, A, B> where B: AsRef<A> {
+	type Target = A;
+	fn deref(&self) -> &A {
+		match self {
+			CowLike::Borrowed(b) => b,
+			CowLike::Owned(o) => o.as_ref(),
+		}
+	}
+}
+
 impl AuthorityRound {
 	/// Create a new instance of AuthorityRound engine.
 	pub fn new(our_params: AuthorityRoundParams, machine: EthereumMachine) -> Result<Arc<Self>, Error> {
@@ -604,13 +633,15 @@ impl AuthorityRound {
 		let engine = Arc::new(
 			AuthorityRound {
 				transition_service: IoService::<()>::start()?,
-				step: Arc::new(Step {
-					inner: AtomicUsize::new(initial_step),
-					calibrate: our_params.start_step.is_none(),
-					duration: our_params.step_duration,
+				step: Arc::new(PermissionedStep {
+					inner: Step {
+						inner: AtomicUsize::new(initial_step),
+						calibrate: our_params.start_step.is_none(),
+						duration: our_params.step_duration,
+					},
+					can_propose: AtomicBool::new(true),
 				}),
-				can_propose: AtomicBool::new(true),
-				client: RwLock::new(None),
+				client: Arc::new(RwLock::new(None)),
 				signer: Default::default(),
 				validators: our_params.validators,
 				validate_score_transition: our_params.validate_score_transition,
@@ -619,6 +650,8 @@ impl AuthorityRound {
 				epoch_manager: Mutex::new(EpochManager::blank()),
 				immediate_transitions: our_params.immediate_transitions,
 				block_reward: our_params.block_reward,
+				block_reward_contract_transition: our_params.block_reward_contract_transition,
+				block_reward_contract: our_params.block_reward_contract,
 				maximum_uncle_count_transition: our_params.maximum_uncle_count_transition,
 				maximum_uncle_count: our_params.maximum_uncle_count,
 				empty_steps_transition: our_params.empty_steps_transition,
@@ -628,10 +661,37 @@ impl AuthorityRound {
 
 		// Do not initialize timeouts for tests.
 		if should_timeout {
-			let handler = TransitionHandler { engine: Arc::downgrade(&engine) };
+			let handler = TransitionHandler {
+				step: engine.step.clone(),
+				client: engine.client.clone(),
+			};
 			engine.transition_service.register_handler(Arc::new(handler))?;
 		}
 		Ok(engine)
+	}
+
+	// fetch correct validator set for epoch at header, taking into account
+	// finality of previous transitions.
+	fn epoch_set<'a>(&'a self, header: &Header) -> Result<(CowLike<ValidatorSet, SimpleList>, BlockNumber), Error> {
+		Ok(if self.immediate_transitions {
+			(CowLike::Borrowed(&*self.validators), header.number())
+		} else {
+			let mut epoch_manager = self.epoch_manager.lock();
+			let client = match self.client.read().as_ref().and_then(|weak| weak.upgrade()) {
+				Some(client) => client,
+				None => {
+					debug!(target: "engine", "Unable to verify sig: missing client ref.");
+					return Err(EngineError::RequiresClient.into())
+				}
+			};
+
+			if !epoch_manager.zoom_to(&*client, &self.machine, &*self.validators, header) {
+				debug!(target: "engine", "Unable to zoom to epoch.");
+				return Err(EngineError::RequiresClient.into())
+			}
+
+			(CowLike::Owned(epoch_manager.validators().clone()), epoch_manager.epoch_transition_number)
+		})
 	}
 
 	fn empty_steps(&self, from_step: U256, to_step: U256, parent_hash: H256) -> Vec<EmptyStep> {
@@ -641,7 +701,6 @@ impl AuthorityRound {
 				e.parent_hash == parent_hash
 		}).cloned().collect()
 	}
-
 
 	fn clear_empty_steps(&self, step: U256) {
 		// clear old `empty_steps` messages
@@ -654,7 +713,7 @@ impl AuthorityRound {
 	}
 
 	fn generate_empty_step(&self, parent_hash: &H256) {
-		let step = self.step.load();
+		let step = self.step.inner.load();
 		let empty_step_rlp = empty_step_rlp(step, parent_hash);
 
 		if let Ok(signature) = self.sign(keccak(&empty_step_rlp)).map(Into::into) {
@@ -679,6 +738,28 @@ impl AuthorityRound {
 			}
 		}
 	}
+
+	fn report_skipped(&self, header: &Header, current_step: usize, parent_step: usize, validators: &ValidatorSet, set_number: u64) {
+		// we're building on top of the genesis block so don't report any skipped steps
+		if header.number() == 1 {
+			return;
+		}
+
+		if let (true, Some(me)) = (current_step > parent_step + 1, self.signer.read().address()) {
+			debug!(target: "engine", "Author {} built block with step gap. current step: {}, parent step: {}",
+				   header.author(), current_step, parent_step);
+			let mut reported = HashSet::new();
+			for step in parent_step + 1..current_step {
+				let skipped_primary = step_proposer(validators, header.parent_hash(), step);
+				// Do not report this signer.
+				if skipped_primary != me {
+					// Stop reporting once validators start repeating.
+					if !reported.insert(skipped_primary) { break; }
+					self.validators.report_benign(&skipped_primary, set_number, header.number());
+ 				}
+ 			}
+		}
+	}
 }
 
 fn unix_now() -> Duration {
@@ -686,34 +767,37 @@ fn unix_now() -> Duration {
 }
 
 struct TransitionHandler {
-	engine: Weak<AuthorityRound>,
+	step: Arc<PermissionedStep>,
+	client: Arc<RwLock<Option<Weak<EngineClient>>>>,
 }
 
 const ENGINE_TIMEOUT_TOKEN: TimerToken = 23;
 
 impl IoHandler<()> for TransitionHandler {
 	fn initialize(&self, io: &IoContext<()>) {
-		if let Some(engine) = self.engine.upgrade() {
-			let remaining = engine.step.duration_remaining();
-			io.register_timer_once(ENGINE_TIMEOUT_TOKEN, remaining.as_millis())
-				.unwrap_or_else(|e| warn!(target: "engine", "Failed to start consensus step timer: {}.", e))
-		}
+		let remaining = AsMillis::as_millis(&self.step.inner.duration_remaining());
+		io.register_timer_once(ENGINE_TIMEOUT_TOKEN, Duration::from_millis(remaining))
+			.unwrap_or_else(|e| warn!(target: "engine", "Failed to start consensus step timer: {}.", e))
 	}
 
 	fn timeout(&self, io: &IoContext<()>, timer: TimerToken) {
 		if timer == ENGINE_TIMEOUT_TOKEN {
-			if let Some(engine) = self.engine.upgrade() {
-				// NOTE we might be lagging by couple of steps in case the timeout
-				// has not been called fast enough.
-				// Make sure to advance up to the actual step.
-				while engine.step.duration_remaining().as_millis() == 0 {
-					engine.step();
+			// NOTE we might be lagging by couple of steps in case the timeout
+			// has not been called fast enough.
+			// Make sure to advance up to the actual step.
+			while AsMillis::as_millis(&self.step.inner.duration_remaining()) == 0 {
+				self.step.inner.increment();
+				self.step.can_propose.store(true, AtomicOrdering::SeqCst);
+				if let Some(ref weak) = *self.client.read() {
+					if let Some(c) = weak.upgrade() {
+						c.update_sealing();
+					}
 				}
-
-				let next_run_at = engine.step.duration_remaining().as_millis() >> 2;
-				io.register_timer_once(ENGINE_TIMEOUT_TOKEN, next_run_at)
-					.unwrap_or_else(|e| warn!(target: "engine", "Failed to restart consensus step timer: {}.", e))
 			}
+
+			let next_run_at = AsMillis::as_millis(&self.step.inner.duration_remaining()) >> 2;
+			io.register_timer_once(ENGINE_TIMEOUT_TOKEN, Duration::from_millis(next_run_at))
+				.unwrap_or_else(|e| warn!(target: "engine", "Failed to restart consensus step timer: {}.", e))
 		}
 	}
 }
@@ -730,8 +814,8 @@ impl Engine<EthereumMachine> for AuthorityRound {
 	}
 
 	fn step(&self) {
-		self.step.increment();
-		self.can_propose.store(true, AtomicOrdering::SeqCst);
+		self.step.inner.increment();
+		self.step.can_propose.store(true, AtomicOrdering::SeqCst);
 		if let Some(ref weak) = *self.client.read() {
 			if let Some(c) = weak.upgrade() {
 				c.update_sealing();
@@ -778,7 +862,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 
 	fn populate_from_parent(&self, header: &mut Header, parent: &Header) {
 		let parent_step = header_step(parent, self.empty_steps_transition).expect("Header has been verified; qed");
-		let current_step = self.step.load();
+		let current_step = self.step.inner.load();
 
 		let current_empty_steps_len = if header.number() >= self.empty_steps_transition {
 			self.empty_steps(parent_step.into(), current_step.into(), parent.hash()).len()
@@ -800,11 +884,11 @@ impl Engine<EthereumMachine> for AuthorityRound {
 			EngineError::MalformedMessage(format!("{:?}", x))
 		}
 
-		let rlp = UntrustedRlp::new(rlp);
+		let rlp = Rlp::new(rlp);
 		let empty_step: EmptyStep = rlp.as_val().map_err(fmt_err)?;;
 
 		if empty_step.verify(&*self.validators).unwrap_or(false) {
-			if self.step.check_future(empty_step.step).is_ok() {
+			if self.step.inner.check_future(empty_step.step).is_ok() {
 				trace!(target: "engine", "handle_message: received empty step message {:?}", empty_step);
 				self.handle_empty_step_message(empty_step);
 			} else {
@@ -824,13 +908,16 @@ impl Engine<EthereumMachine> for AuthorityRound {
 	fn generate_seal(&self, block: &ExecutedBlock, parent: &Header) -> Seal {
 		// first check to avoid generating signature most of the time
 		// (but there's still a race to the `compare_and_swap`)
-		if !self.can_propose.load(AtomicOrdering::SeqCst) { return Seal::None; }
+		if !self.step.can_propose.load(AtomicOrdering::SeqCst) {
+			trace!(target: "engine", "Aborting seal generation. Can't propose.");
+			return Seal::None;
+		}
 
 		let header = block.header();
 		let parent_step: U256 = header_step(parent, self.empty_steps_transition)
 			.expect("Header has been verified; qed").into();
 
-		let step = self.step.load();
+		let step = self.step.inner.load();
 
 		// filter messages from old and future steps and different parents
 		let empty_steps = if header.number() >= self.empty_steps_transition {
@@ -852,32 +939,15 @@ impl Engine<EthereumMachine> for AuthorityRound {
 			return Seal::None;
 		}
 
-		// fetch correct validator set for current epoch, taking into account
-		// finality of previous transitions.
-		let active_set;
-
-		let validators = if self.immediate_transitions {
-			&*self.validators
-		} else {
-			let mut epoch_manager = self.epoch_manager.lock();
-			let client = match self.client.read().as_ref().and_then(|weak| weak.upgrade()) {
-				Some(client) => client,
-				None => {
-					warn!(target: "engine", "Unable to generate seal: missing client ref.");
-					return Seal::None;
-				}
-			};
-
-			if !epoch_manager.zoom_to(&*client, &self.machine, &*self.validators, header) {
-				debug!(target: "engine", "Unable to zoom to epoch.");
+		let (validators, set_number) = match self.epoch_set(header) {
+			Err(err) => {
+				warn!(target: "engine", "Unable to generate seal: {}", err);
 				return Seal::None;
-			}
-
-			active_set = epoch_manager.validators().clone();
-			&active_set as &_
+			},
+			Ok(ok) => ok,
 		};
 
-		if is_step_proposer(validators, header.parent_hash(), step, header.author()) {
+		if is_step_proposer(&*validators, header.parent_hash(), step, header.author()) {
 			// this is guarded against by `can_propose` unless the block was signed
 			// on the same step (implies same key) and on a different node.
 			if parent_step == step.into() {
@@ -907,9 +977,15 @@ impl Engine<EthereumMachine> for AuthorityRound {
 				trace!(target: "engine", "generate_seal: Issuing a block for step {}.", step);
 
 				// only issue the seal if we were the first to reach the compare_and_swap.
-				if self.can_propose.compare_and_swap(true, false, AtomicOrdering::SeqCst) {
-
+				if self.step.can_propose.compare_and_swap(true, false, AtomicOrdering::SeqCst) {
+					// we can drop all accumulated empty step messages that are
+					// older than the parent step since we're including them in
+					// the seal
 					self.clear_empty_steps(parent_step);
+
+					// report any skipped primaries between the parent block and
+					// the block we're sealing
+					self.report_skipped(header, step, u64::from(parent_step) as usize, &*validators, set_number);
 
 					let mut fields = vec![
 						encode(&step).into_vec(),
@@ -941,6 +1017,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 		&self,
 		block: &mut ExecutedBlock,
 		epoch_begin: bool,
+		_ancestry: &mut Iterator<Item=ExtendedHeader>,
 	) -> Result<(), Error> {
 		// with immediate transitions, we don't use the epoch mechanism anyway.
 		// the genesis is always considered an epoch, but we ignore it intentionally.
@@ -966,9 +1043,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 
 	/// Apply the block reward on finalisation of the block.
 	fn on_close_block(&self, block: &mut ExecutedBlock) -> Result<(), Error> {
-		use parity_machine::WithBalances;
-
-		let mut rewards = Vec::new();
+		let mut benefactors = Vec::new();
 		if block.header().number() >= self.empty_steps_transition {
 			let empty_steps = if block.header().seal().is_empty() {
 				// this is a new block, calculate rewards based on the empty steps messages we have accumulated
@@ -982,10 +1057,10 @@ impl Engine<EthereumMachine> for AuthorityRound {
 
 				let parent = client.block_header(::client::BlockId::Hash(*block.header().parent_hash()))
 					.expect("hash is from parent; parent header must exist; qed")
-					.decode();
+					.decode()?;
 
 				let parent_step = header_step(&parent, self.empty_steps_transition)?;
-				let current_step = self.step.load();
+				let current_step = self.step.inner.load();
 				self.empty_steps(parent_step.into(), current_step.into(), parent.hash())
 			} else {
 				// we're verifying a block, extract empty steps from the seal
@@ -994,17 +1069,36 @@ impl Engine<EthereumMachine> for AuthorityRound {
 
 			for empty_step in empty_steps {
 				let author = empty_step.author()?;
-				rewards.push((author, self.block_reward));
+				benefactors.push((author, RewardKind::EmptyStep));
 			}
 		}
 
 		let author = *block.header().author();
-		rewards.push((author, self.block_reward));
+		benefactors.push((author, RewardKind::Author));
 
-		for &(ref author, ref block_reward) in rewards.iter() {
-			self.machine.add_balance(block, author, block_reward)?;
-		}
-		self.machine.note_rewards(block, &rewards, &[])
+		let rewards: Vec<_> = match self.block_reward_contract {
+			Some(ref c) if block.header().number() >= self.block_reward_contract_transition => {
+				// NOTE: this logic should be moved to a function when another
+				//       engine needs support for block reward contract.
+				let mut call = |to, data| {
+					let result = self.machine.execute_as_system(
+						block,
+						to,
+						U256::max_value(), // unbounded gas? maybe make configurable.
+						Some(data),
+					);
+					result.map_err(|e| format!("{}", e))
+				};
+
+				let rewards = c.reward(&benefactors, &mut call)?;
+				rewards.into_iter().map(|(author, amount)| (author, RewardKind::External, amount)).collect()
+			},
+			_ => {
+				benefactors.into_iter().map(|(author, reward_kind)| (author, reward_kind, self.block_reward)).collect()
+			},
+		};
+
+		block_reward::apply_block_rewards(&rewards, block, &self.machine)
 	}
 
 	/// Check the number of seal fields.
@@ -1015,13 +1109,21 @@ impl Engine<EthereumMachine> for AuthorityRound {
 			)));
 		}
 
-		// TODO [ToDr] Should this go from epoch manager?
-		// If yes then probably benign reporting needs to be moved further in the verification.
-		let set_number = header.number();
-
-		match verify_timestamp(&*self.step, header_step(header, self.empty_steps_transition)?) {
+		match verify_timestamp(&self.step.inner, header_step(header, self.empty_steps_transition)?) {
 			Err(BlockError::InvalidSeal) => {
-				self.validators.report_benign(header.author(), set_number, header.number());
+				// This check runs in Phase 1 where there is no guarantee that the parent block is
+				// already imported, therefore the call to `epoch_set` may fail. In that case we
+				// won't report the misbehavior but this is not a concern because:
+				// - Only authorities can report and it's expected that they'll be up-to-date and
+				//   importing, therefore the parent header will most likely be available
+				// - Even if you are an authority that is syncing the chain, the contract will most
+				//   likely ignore old reports
+				// - This specific check is only relevant if you're importing (since it checks
+				//   against wall clock)
+				if let Ok((_, set_number)) = self.epoch_set(header) {
+					self.validators.report_benign(header.author(), set_number, header.number());
+				}
+
 				Err(BlockError::InvalidSeal.into())
 			}
 			Err(e) => Err(e.into()),
@@ -1033,8 +1135,8 @@ impl Engine<EthereumMachine> for AuthorityRound {
 	fn verify_block_family(&self, header: &Header, parent: &Header) -> Result<(), Error> {
 		let step = header_step(header, self.empty_steps_transition)?;
 		let parent_step = header_step(parent, self.empty_steps_transition)?;
-		// TODO [ToDr] Should this go from epoch manager?
-		let set_number = header.number();
+
+		let (validators, set_number) = self.epoch_set(header)?;
 
 		// Ensure header is from the step after parent.
 		if step == parent_step
@@ -1061,7 +1163,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 							format!("empty step proof for invalid parent hash: {:?}", empty_step.parent_hash)))?;
 					}
 
-					if !empty_step.verify(&*self.validators).unwrap_or(false) {
+					if !empty_step.verify(&*validators).unwrap_or(false) {
 						Err(EngineError::InsufficientProof(
 							format!("invalid empty step proof: {:?}", empty_step)))?;
 					}
@@ -1075,21 +1177,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 			}
 
 		} else {
-			// Report skipped primaries.
-			if let (true, Some(me)) = (step > parent_step + 1, self.signer.read().address()) {
-				debug!(target: "engine", "Author {} built block with step gap. current step: {}, parent step: {}",
-					   header.author(), step, parent_step);
-				let mut reported = HashSet::new();
-				for s in parent_step + 1..step {
-					let skipped_primary = step_proposer(&*self.validators, &parent.hash(), s);
-					// Do not report this signer.
-					if skipped_primary != me {
-						self.validators.report_benign(&skipped_primary, set_number, header.number());
-						// Stop reporting once validators start repeating.
-						if !reported.insert(skipped_primary) { break; }
- 					}
- 				}
-			}
+			self.report_skipped(header, step, parent_step, &*validators, set_number);
 		}
 
 		Ok(())
@@ -1097,37 +1185,21 @@ impl Engine<EthereumMachine> for AuthorityRound {
 
 	// Check the validators.
 	fn verify_block_external(&self, header: &Header) -> Result<(), Error> {
-		// fetch correct validator set for current epoch, taking into account
-		// finality of previous transitions.
-		let active_set;
-		let validators = if self.immediate_transitions {
-			&*self.validators
-		} else {
-			// get correct validator set for epoch.
-			let client = match self.client.read().as_ref().and_then(|weak| weak.upgrade()) {
-				Some(client) => client,
-				None => {
-					debug!(target: "engine", "Unable to verify sig: missing client ref.");
-					return Err(EngineError::RequiresClient.into())
-				}
-			};
-
-			let mut epoch_manager = self.epoch_manager.lock();
-			if !epoch_manager.zoom_to(&*client, &self.machine, &*self.validators, header) {
-				debug!(target: "engine", "Unable to zoom to epoch.");
-				return Err(EngineError::RequiresClient.into())
-			}
-
-			active_set = epoch_manager.validators().clone();
-			&active_set as &_
-		};
+		let (validators, set_number) = self.epoch_set(header)?;
 
 		// verify signature against fixed list, but reports should go to the
 		// contract itself.
-		let res = verify_external(header, validators, self.empty_steps_transition);
-		if res.is_ok() {
-			let header_step = header_step(header, self.empty_steps_transition)?;
-			self.clear_empty_steps(header_step.into());
+		let res = verify_external(header, &*validators, self.empty_steps_transition);
+		match res {
+			Err(Error(ErrorKind::Engine(EngineError::NotProposer(_)), _)) => {
+				self.validators.report_benign(header.author(), set_number, header.number());
+			},
+			Ok(_) => {
+				// we can drop all accumulated empty step messages that are older than this header's step
+				let header_step = header_step(header, self.empty_steps_transition)?;
+				self.clear_empty_steps(header_step.into());
+			},
+			_ => {},
 		}
 		res
 	}
@@ -1261,7 +1333,7 @@ impl Engine<EthereumMachine> for AuthorityRound {
 						// This way, upon encountering an epoch change, the proposer from the
 						// new set will be forced to wait until the next step to avoid sealing a
 						// block that breaks the invariant that the parent's step < the block's step.
-						self.can_propose.store(false, AtomicOrdering::SeqCst);
+						self.step.can_propose.store(false, AtomicOrdering::SeqCst);
 						return Some(combine_proofs(signal_number, &pending.proof, &*finality_proof));
 					}
 				}
@@ -1300,12 +1372,12 @@ impl Engine<EthereumMachine> for AuthorityRound {
 		self.validators.register_client(client);
 	}
 
-	fn set_signer(&self, ap: Arc<AccountProvider>, address: Address, password: String) {
+	fn set_signer(&self, ap: Arc<AccountProvider>, address: Address, password: Password) {
 		self.signer.write().set(ap, address, password);
 	}
 
 	fn sign(&self, hash: H256) -> Result<Signature, Error> {
-		self.signer.read().sign(hash).map_err(Into::into)
+		Ok(self.signer.read().sign(hash)?)
 	}
 
 	fn snapshot_components(&self) -> Option<Box<::snapshot::SnapshotComponents>> {
@@ -1314,6 +1386,10 @@ impl Engine<EthereumMachine> for AuthorityRound {
 		} else {
 			Some(Box::new(::snapshot::PoaSnapshot))
 		}
+	}
+
+	fn fork_choice(&self, new: &ExtendedHeader, current: &ExtendedHeader) -> super::ForkChoice {
+		super::total_difficulty_fork_choice(new, current)
 	}
 }
 
@@ -1326,7 +1402,7 @@ mod tests {
 	use header::Header;
 	use rlp::encode;
 	use block::*;
-	use tests::helpers::{
+	use test_helpers::{
 		generate_dummy_client_with_spec_and_accounts, get_temp_state_db, generate_dummy_client,
 		TestNotify
 	};
@@ -1335,7 +1411,7 @@ mod tests {
 	use transaction::{Action, Transaction};
 	use engines::{Seal, Engine, EngineError, EthEngine};
 	use engines::validator_set::TestSet;
-	use error::Error;
+	use error::{Error, ErrorKind};
 	use super::{AuthorityRoundParams, AuthorityRound, EmptyStep, SealedEmptyStep};
 
 	#[test]
@@ -1365,8 +1441,8 @@ mod tests {
 	#[test]
 	fn generates_seal_and_does_not_double_propose() {
 		let tap = Arc::new(AccountProvider::transient_provider());
-		let addr1 = tap.insert_account(keccak("1").into(), "1").unwrap();
-		let addr2 = tap.insert_account(keccak("2").into(), "2").unwrap();
+		let addr1 = tap.insert_account(keccak("1").into(), &"1".into()).unwrap();
+		let addr2 = tap.insert_account(keccak("2").into(), &"2".into()).unwrap();
 
 		let spec = Spec::new_test_round();
 		let engine = &*spec.engine;
@@ -1374,9 +1450,9 @@ mod tests {
 		let db1 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let db2 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
-		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes, addr2, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes, addr2, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b2 = b2.close_and_lock();
 
 		engine.set_signer(tap.clone(), addr1, "1".into());
@@ -1397,8 +1473,8 @@ mod tests {
 	#[test]
 	fn checks_difficulty_in_generate_seal() {
 		let tap = Arc::new(AccountProvider::transient_provider());
-		let addr1 = tap.insert_account(keccak("1").into(), "1").unwrap();
-		let addr2 = tap.insert_account(keccak("0").into(), "0").unwrap();
+		let addr1 = tap.insert_account(keccak("1").into(), &"1".into()).unwrap();
+		let addr2 = tap.insert_account(keccak("0").into(), &"0".into()).unwrap();
 
 		let spec = Spec::new_test_round();
 		let engine = &*spec.engine;
@@ -1408,9 +1484,9 @@ mod tests {
 		let db2 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
 
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
-		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes, addr2, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes, addr2, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b2 = b2.close_and_lock();
 
 		engine.set_signer(tap.clone(), addr1, "1".into());
@@ -1431,7 +1507,7 @@ mod tests {
 	#[test]
 	fn proposer_switching() {
 		let tap = AccountProvider::transient_provider();
-		let addr = tap.insert_account(keccak("0").into(), "0").unwrap();
+		let addr = tap.insert_account(keccak("0").into(), &"0".into()).unwrap();
 		let mut parent_header: Header = Header::default();
 		parent_header.set_seal(vec![encode(&0usize).into_vec()]);
 		parent_header.set_gas_limit("222222".parse::<U256>().unwrap());
@@ -1456,7 +1532,7 @@ mod tests {
 	#[test]
 	fn rejects_future_block() {
 		let tap = AccountProvider::transient_provider();
-		let addr = tap.insert_account(keccak("0").into(), "0").unwrap();
+		let addr = tap.insert_account(keccak("0").into(), &"0".into()).unwrap();
 
 		let mut parent_header: Header = Header::default();
 		parent_header.set_seal(vec![encode(&0usize).into_vec()]);
@@ -1481,7 +1557,7 @@ mod tests {
 	#[test]
 	fn rejects_step_backwards() {
 		let tap = AccountProvider::transient_provider();
-		let addr = tap.insert_account(keccak("0").into(), "0").unwrap();
+		let addr = tap.insert_account(keccak("0").into(), &"0".into()).unwrap();
 
 		let mut parent_header: Header = Header::default();
 		parent_header.set_seal(vec![encode(&4usize).into_vec()]);
@@ -1517,6 +1593,8 @@ mod tests {
 			empty_steps_transition: u64::max_value(),
 			maximum_empty_steps: 0,
 			block_reward: Default::default(),
+			block_reward_contract_transition: 0,
+			block_reward_contract: Default::default(),
 		};
 
 		let aura = {
@@ -1530,7 +1608,6 @@ mod tests {
 		parent_header.set_seal(vec![encode(&1usize).into_vec()]);
 		parent_header.set_gas_limit("222222".parse::<U256>().unwrap());
 		let mut header: Header = Header::default();
-		header.set_number(1);
 		header.set_gas_limit("222222".parse::<U256>().unwrap());
 		header.set_seal(vec![encode(&3usize).into_vec()]);
 
@@ -1538,10 +1615,17 @@ mod tests {
 		assert!(aura.verify_block_family(&header, &parent_header).is_ok());
 		assert_eq!(last_benign.load(AtomicOrdering::SeqCst), 0);
 
-		aura.set_signer(Arc::new(AccountProvider::transient_provider()), Default::default(), Default::default());
+		aura.set_signer(Arc::new(AccountProvider::transient_provider()), Default::default(), "".into());
 
+		// Do not report on steps skipped between genesis and first block.
+		header.set_number(1);
 		assert!(aura.verify_block_family(&header, &parent_header).is_ok());
-		assert_eq!(last_benign.load(AtomicOrdering::SeqCst), 1);
+		assert_eq!(last_benign.load(AtomicOrdering::SeqCst), 0);
+
+		// Report on skipped steps otherwise.
+		header.set_number(2);
+		assert!(aura.verify_block_family(&header, &parent_header).is_ok());
+		assert_eq!(last_benign.load(AtomicOrdering::SeqCst), 2);
 	}
 
 	#[test]
@@ -1559,6 +1643,8 @@ mod tests {
 			empty_steps_transition: u64::max_value(),
 			maximum_empty_steps: 0,
 			block_reward: Default::default(),
+			block_reward_contract_transition: 0,
+			block_reward_contract: Default::default(),
 		};
 
 		let aura = {
@@ -1613,6 +1699,8 @@ mod tests {
 			empty_steps_transition: u64::max_value(),
 			maximum_empty_steps: 0,
 			block_reward: Default::default(),
+			block_reward_contract_transition: 0,
+			block_reward_contract: Default::default(),
 		};
 
 		let mut c_params = ::spec::CommonParams::default();
@@ -1625,8 +1713,8 @@ mod tests {
 		let spec = Spec::new_test_round_empty_steps();
 		let tap = Arc::new(AccountProvider::transient_provider());
 
-		let addr1 = tap.insert_account(keccak("1").into(), "1").unwrap();
-		let addr2 = tap.insert_account(keccak("0").into(), "0").unwrap();
+		let addr1 = tap.insert_account(keccak("1").into(), &"1".into()).unwrap();
+		let addr2 = tap.insert_account(keccak("0").into(), &"0".into()).unwrap();
 
 		let accounts = vec![addr1, addr2];
 
@@ -1657,7 +1745,7 @@ mod tests {
 		let db1 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
 
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
 
 		let client = generate_dummy_client(0);
@@ -1692,7 +1780,7 @@ mod tests {
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
 
 		// step 2
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
 
 		// since the block is empty it isn't sealed and we generate empty steps
@@ -1701,7 +1789,7 @@ mod tests {
 		engine.step();
 
 		// step 3
-		let mut b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr2, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let mut b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr2, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		b2.push_transaction(Transaction {
 			action: Action::Create,
 			nonce: U256::from(0),
@@ -1740,7 +1828,7 @@ mod tests {
 		let last_hashes = Arc::new(vec![genesis_header.hash()]);
 
 		// step 2
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
 
 		// since the block is empty it isn't sealed and we generate empty steps
@@ -1749,7 +1837,7 @@ mod tests {
 		engine.step();
 
 		// step 3
-		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr2, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr2, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b2 = b2.close_and_lock();
 		engine.set_signer(tap.clone(), addr2, "0".into());
 		assert_eq!(engine.generate_seal(b2.block(), &genesis_header), Seal::None);
@@ -1757,7 +1845,7 @@ mod tests {
 
 		// step 4
 		// the spec sets the maximum_empty_steps to 2 so we will now seal an empty block and include the empty step messages
-		let b3 = OpenBlock::new(engine, Default::default(), false, db3, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b3 = OpenBlock::new(engine, Default::default(), false, db3, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b3 = b3.close_and_lock();
 
 		engine.set_signer(tap.clone(), addr1, "1".into());
@@ -1790,7 +1878,7 @@ mod tests {
 		engine.register_client(Arc::downgrade(&client) as _);
 
 		// step 2
-		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b1 = OpenBlock::new(engine, Default::default(), false, db1, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let b1 = b1.close_and_lock();
 
 		// since the block is empty it isn't sealed and we generate empty steps
@@ -1800,7 +1888,7 @@ mod tests {
 
 		// step 3
 		// the signer of the accumulated empty step message should be rewarded
-		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false).unwrap();
+		let b2 = OpenBlock::new(engine, Default::default(), false, db2, &genesis_header, last_hashes.clone(), addr1, (3141562.into(), 31415620.into()), vec![], false, &mut Vec::new().into_iter()).unwrap();
 		let addr1_balance = b2.block().state().balance(&addr1).unwrap();
 
 		// after closing the block `addr1` should be reward twice, one for the included empty step message and another for block creation
@@ -1838,7 +1926,7 @@ mod tests {
 		]);
 
 		assert!(match engine.verify_block_family(&header, &parent_header) {
-			Err(Error::Engine(EngineError::InsufficientProof(ref s)))
+			Err(Error(ErrorKind::Engine(EngineError::InsufficientProof(ref s)), _))
 				if s.contains("invalid step") => true,
 			_ => false,
 		});
@@ -1852,7 +1940,7 @@ mod tests {
 		]);
 
 		assert!(match engine.verify_block_family(&header, &parent_header) {
-			Err(Error::Engine(EngineError::InsufficientProof(ref s)))
+			Err(Error(ErrorKind::Engine(EngineError::InsufficientProof(ref s)), _))
 				if s.contains("invalid empty step proof") => true,
 			_ => false,
 		});
@@ -1867,7 +1955,7 @@ mod tests {
 		]);
 
 		assert!(match engine.verify_block_family(&header, &parent_header) {
-			Err(Error::Engine(EngineError::InsufficientProof(ref s)))
+			Err(Error(ErrorKind::Engine(EngineError::InsufficientProof(ref s)), _))
 				if s.contains("invalid empty step proof") => true,
 			_ => false,
 		});
@@ -1889,5 +1977,74 @@ mod tests {
 			Ok(_) => true,
 			_ => false,
 		});
+	}
+
+	#[test]
+	fn block_reward_contract() {
+		let spec = Spec::new_test_round_block_reward_contract();
+		let tap = Arc::new(AccountProvider::transient_provider());
+
+		let addr1 = tap.insert_account(keccak("1").into(), &"1".into()).unwrap();
+
+		let engine = &*spec.engine;
+		let genesis_header = spec.genesis_header();
+		let db1 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
+		let db2 = spec.ensure_db_good(get_temp_state_db(), &Default::default()).unwrap();
+
+		let last_hashes = Arc::new(vec![genesis_header.hash()]);
+
+		let client = generate_dummy_client_with_spec_and_accounts(
+			Spec::new_test_round_block_reward_contract,
+			None,
+		);
+		engine.register_client(Arc::downgrade(&client) as _);
+
+		// step 2
+		let b1 = OpenBlock::new(
+			engine,
+			Default::default(),
+			false,
+			db1,
+			&genesis_header,
+			last_hashes.clone(),
+			addr1,
+			(3141562.into(), 31415620.into()),
+			vec![],
+			false,
+			&mut Vec::new().into_iter(),
+		).unwrap();
+		let b1 = b1.close_and_lock();
+
+		// since the block is empty it isn't sealed and we generate empty steps
+		engine.set_signer(tap.clone(), addr1, "1".into());
+		assert_eq!(engine.generate_seal(b1.block(), &genesis_header), Seal::None);
+		engine.step();
+
+		// step 3
+		// the signer of the accumulated empty step message should be rewarded
+		let b2 = OpenBlock::new(
+			engine,
+			Default::default(),
+			false,
+			db2,
+			&genesis_header,
+			last_hashes.clone(),
+			addr1,
+			(3141562.into(), 31415620.into()),
+			vec![],
+			false,
+			&mut Vec::new().into_iter(),
+		).unwrap();
+		let addr1_balance = b2.block().state().balance(&addr1).unwrap();
+
+		// after closing the block `addr1` should be reward twice, one for the included empty step
+		// message and another for block creation
+		let b2 = b2.close_and_lock();
+
+		// the contract rewards (1000 + kind) for each benefactor/reward kind
+		assert_eq!(
+			b2.block().state().balance(&addr1).unwrap(),
+			addr1_balance + (1000 + 0).into() + (1000 + 2).into(),
+		)
 	}
 }

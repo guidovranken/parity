@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -15,7 +15,7 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 extern crate parking_lot;
-extern crate ethcore_bytes;
+extern crate parity_bytes;
 extern crate ethcore_io as io;
 extern crate ethcore_logger;
 extern crate ethcore_network;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::*;
 use parking_lot::Mutex;
-use ethcore_bytes::Bytes;
+use parity_bytes::Bytes;
 use ethcore_network::*;
 use ethcore_network_devp2p::NetworkService;
 use ethkey::{Random, Generator};
@@ -52,7 +52,7 @@ impl TestProtocol {
 	/// Creates and register protocol with the network service
 	pub fn register(service: &mut NetworkService, drop_session: bool) -> Arc<TestProtocol> {
 		let handler = Arc::new(TestProtocol::new(drop_session));
-		service.register_protocol(handler.clone(), *b"tst", 1, &[42u8, 43u8]).expect("Error registering test protocol handler");
+		service.register_protocol(handler.clone(), *b"tst", &[(42u8, 1u8), (43u8, 1u8)]).expect("Error registering test protocol handler");
 		handler
 	}
 
@@ -70,8 +70,8 @@ impl TestProtocol {
 }
 
 impl NetworkProtocolHandler for TestProtocol {
-	fn initialize(&self, io: &NetworkContext, _host_info: &HostInfo) {
-		io.register_timer(0, 10).unwrap();
+	fn initialize(&self, io: &NetworkContext) {
+		io.register_timer(0, Duration::from_millis(10)).unwrap();
 	}
 
 	fn read(&self, _io: &NetworkContext, _peer: &PeerId, packet_id: u8, data: &[u8]) {
@@ -99,12 +99,11 @@ impl NetworkProtocolHandler for TestProtocol {
 	}
 }
 
-
 #[test]
 fn net_service() {
 	let service = NetworkService::new(NetworkConfiguration::new_local(), None).expect("Error creating network service");
 	service.start().unwrap();
-	service.register_protocol(Arc::new(TestProtocol::new(false)), *b"myp", 1, &[1u8]).unwrap();
+	service.register_protocol(Arc::new(TestProtocol::new(false)), *b"myp", &[(1u8, 1u8)]).unwrap();
 }
 
 #[test]
@@ -112,7 +111,7 @@ fn net_start_stop() {
 	let config = NetworkConfiguration::new_local();
 	let service = NetworkService::new(config, None).unwrap();
 	service.start().unwrap();
-	service.stop().unwrap();
+	service.stop();
 	service.start().unwrap();
 }
 

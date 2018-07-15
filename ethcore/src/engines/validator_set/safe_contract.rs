@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,27 +16,23 @@
 
 /// Validator set maintained in a contract, updated using `getValidators` method.
 
-use std::sync::{Weak, Arc};
-use hash::keccak;
-
-use ethereum_types::{H256, U256, Address, Bloom};
-use parking_lot::RwLock;
-
 use bytes::Bytes;
-use memory_cache::MemoryLruCache;
-use unexpected::Mismatch;
-use rlp::{UntrustedRlp, RlpStream};
-use kvdb::DBValue;
-
 use client::EngineClient;
-use machine::{AuxiliaryData, Call, EthereumMachine, AuxiliaryRequest};
+use ethereum_types::{H256, U256, Address, Bloom};
+use hash::keccak;
 use header::Header;
 use ids::BlockId;
+use kvdb::DBValue;
 use log_entry::LogEntry;
+use machine::{AuxiliaryData, Call, EthereumMachine, AuxiliaryRequest};
+use memory_cache::MemoryLruCache;
+use parking_lot::RwLock;
 use receipt::Receipt;
-
+use rlp::{Rlp, RlpStream};
+use std::sync::{Weak, Arc};
 use super::{SystemCall, ValidatorSet};
 use super::simple_list::SimpleList;
+use unexpected::Mismatch;
 
 use_contract!(validator_set, "ValidatorSet", "res/contracts/validator_set.json");
 
@@ -63,7 +59,7 @@ impl ::engines::StateDependentProof<EthereumMachine> for StateProof {
 	}
 
 	fn check_proof(&self, machine: &EthereumMachine, proof: &[u8]) -> Result<(), String> {
-		let (header, state_items) = decode_first_proof(&UntrustedRlp::new(proof))
+		let (header, state_items) = decode_first_proof(&Rlp::new(proof))
 			.map_err(|e| format!("proof incorrectly encoded: {}", e))?;
 		if &header != &self.header {
 			return Err("wrong header in proof".into());
@@ -145,7 +141,7 @@ fn check_first_proof(machine: &EthereumMachine, provider: &validator_set::Valida
 	}).map_err(|err| err.to_string())
 }
 
-fn decode_first_proof(rlp: &UntrustedRlp) -> Result<(Header, Vec<DBValue>), ::error::Error> {
+fn decode_first_proof(rlp: &Rlp) -> Result<(Header, Vec<DBValue>), ::error::Error> {
 	let header = rlp.val_at(0)?;
 	let state_items = rlp.at(1)?.iter().map(|x| {
 		let mut val = DBValue::new();
@@ -165,7 +161,7 @@ fn encode_proof(header: &Header, receipts: &[Receipt]) -> Bytes {
 	stream.drain().into_vec()
 }
 
-fn decode_proof(rlp: &UntrustedRlp) -> Result<(Header, Vec<Receipt>), ::error::Error> {
+fn decode_proof(rlp: &Rlp) -> Result<(Header, Vec<Receipt>), ::error::Error> {
 	Ok((rlp.val_at(0)?, rlp.list_at(1)?))
 }
 
@@ -357,7 +353,7 @@ impl ValidatorSet for ValidatorSafeContract {
 	fn epoch_set(&self, first: bool, machine: &EthereumMachine, _number: ::header::BlockNumber, proof: &[u8])
 		-> Result<(SimpleList, Option<H256>), ::error::Error>
 	{
-		let rlp = UntrustedRlp::new(proof);
+		let rlp = Rlp::new(proof);
 
 		if first {
 			trace!(target: "engine", "Recovering initial epoch set");
@@ -459,7 +455,7 @@ mod tests {
 	use client::{ChainInfo, BlockInfo, ImportBlock};
 	use ethkey::Secret;
 	use miner::MinerService;
-	use tests::helpers::{generate_dummy_client_with_spec_and_accounts, generate_dummy_client_with_spec_and_data};
+	use test_helpers::{generate_dummy_client_with_spec_and_accounts, generate_dummy_client_with_spec_and_data};
 	use super::super::ValidatorSet;
 	use super::{ValidatorSafeContract, EVENT_NAME_HASH};
 
@@ -477,14 +473,14 @@ mod tests {
 	fn knows_validators() {
 		let tap = Arc::new(AccountProvider::transient_provider());
 		let s0: Secret = keccak("1").into();
-		let v0 = tap.insert_account(s0.clone(), "").unwrap();
-		let v1 = tap.insert_account(keccak("0").into(), "").unwrap();
+		let v0 = tap.insert_account(s0.clone(), &"".into()).unwrap();
+		let v1 = tap.insert_account(keccak("0").into(), &"".into()).unwrap();
 		let chain_id = Spec::new_validator_safe_contract().chain_id();
 		let client = generate_dummy_client_with_spec_and_accounts(Spec::new_validator_safe_contract, Some(tap));
 		client.engine().register_client(Arc::downgrade(&client) as _);
 		let validator_contract = "0000000000000000000000000000000000000005".parse::<Address>().unwrap();
 
-		client.miner().set_engine_signer(v1, "".into()).unwrap();
+		client.miner().set_author(v1, Some("".into())).unwrap();
 		// Remove "1" validator.
 		let tx = Transaction {
 			nonce: 0.into(),
@@ -512,11 +508,11 @@ mod tests {
 		assert_eq!(client.chain_info().best_block_number, 1);
 
 		// Switch to the validator that is still there.
-		client.miner().set_engine_signer(v0, "".into()).unwrap();
+		client.miner().set_author(v0, Some("".into())).unwrap();
 		::client::EngineClient::update_sealing(&*client);
 		assert_eq!(client.chain_info().best_block_number, 2);
 		// Switch back to the added validator, since the state is updated.
-		client.miner().set_engine_signer(v1, "".into()).unwrap();
+		client.miner().set_author(v1, Some("".into())).unwrap();
 		let tx = Transaction {
 			nonce: 2.into(),
 			gas_price: 0.into(),

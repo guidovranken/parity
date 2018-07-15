@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -24,10 +24,10 @@ use ids::BlockId;
 use snapshot::service::{Service, ServiceParams};
 use snapshot::{self, ManifestData, SnapshotService};
 use spec::Spec;
-use tests::helpers::generate_dummy_client_with_spec_and_data;
+use test_helpers::{generate_dummy_client_with_spec_and_data, restoration_db_handler};
 
 use io::IoChannel;
-use kvdb_rocksdb::{Database, DatabaseConfig};
+use kvdb_rocksdb::DatabaseConfig;
 
 struct NoopDBRestore;
 
@@ -39,6 +39,9 @@ impl snapshot::DatabaseRestore for NoopDBRestore {
 
 #[test]
 fn restored_is_equivalent() {
+	use ::ethcore_logger::init_log;
+	init_log();
+
 	const NUM_BLOCKS: u32 = 400;
 	const TX_PER: usize = 5;
 
@@ -51,21 +54,22 @@ fn restored_is_equivalent() {
 	let path = tempdir.path().join("snapshot");
 
 	let db_config = DatabaseConfig::with_columns(::db::NUM_COLUMNS);
-	let client_db = Database::open(&db_config, client_db.to_str().unwrap()).unwrap();
+	let restoration = restoration_db_handler(db_config);
+	let blockchain_db = restoration.open(&client_db).unwrap();
 
 	let spec = Spec::new_null();
 	let client2 = Client::new(
 		Default::default(),
 		&spec,
-		Arc::new(client_db),
-		Arc::new(::miner::Miner::with_spec(&spec)),
+		blockchain_db,
+		Arc::new(::miner::Miner::new_for_tests(&spec, None)),
 		IoChannel::disconnected(),
 	).unwrap();
 
 	let service_params = ServiceParams {
 		engine: spec.engine.clone(),
 		genesis_block: spec.genesis_block(),
-		db_config: db_config,
+		restoration_db_handler: restoration,
 		pruning: ::journaldb::Algorithm::Archive,
 		channel: IoChannel::disconnected(),
 		snapshot_root: path,
@@ -107,7 +111,7 @@ fn guards_delete_folders() {
 	let service_params = ServiceParams {
 		engine: spec.engine.clone(),
 		genesis_block: spec.genesis_block(),
-		db_config: DatabaseConfig::with_columns(::db::NUM_COLUMNS),
+		restoration_db_handler: restoration_db_handler(DatabaseConfig::with_columns(::db::NUM_COLUMNS)),
 		pruning: ::journaldb::Algorithm::Archive,
 		channel: IoChannel::disconnected(),
 		snapshot_root: tempdir.path().to_owned(),
@@ -129,12 +133,16 @@ fn guards_delete_folders() {
 	service.init_restore(manifest.clone(), true).unwrap();
 	assert!(path.exists());
 
+	// The `db` folder should have been deleted,
+	// while the `temp` one kept
 	service.abort_restore();
-	assert!(!path.exists());
+	assert!(!path.join("db").exists());
+	assert!(path.join("temp").exists());
 
 	service.init_restore(manifest.clone(), true).unwrap();
 	assert!(path.exists());
 
 	drop(service);
-	assert!(!path.exists());
+	assert!(!path.join("db").exists());
+	assert!(path.join("temp").exists());
 }

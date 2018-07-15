@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -37,7 +37,7 @@ pub fn zero_scalar() -> Secret {
 pub fn to_scalar(hash: H256) -> Result<Secret, Error> {
 	let scalar: U256 = hash.into();
 	let scalar: H256 = (scalar % math::curve_order()).into();
-	let scalar = Secret::from_slice(&*scalar);
+	let scalar = Secret::from(scalar.0);
 	scalar.check_validity()?;
 	Ok(scalar)
 }
@@ -587,9 +587,13 @@ pub mod tests {
 		let publics: Vec<_> = (0..n).map(|i| public_values_generation(t, &derived_point, &polynoms1[i], &polynoms2[i]).unwrap()).collect();
 
 		// keys verification
-		(0..n).map(|i| (0..n).map(|j| if i != j {
-			assert!(keys_verification(t, &derived_point, &id_numbers[i], &secrets1[j][i], &secrets2[j][i], &publics[j]).unwrap());
-		}).collect::<Vec<_>>()).collect::<Vec<_>>();
+		(0..n).for_each(|i| {
+			(0..n)
+				.filter(|&j| i != j)
+				.for_each(|j| {
+					assert!(keys_verification(t, &derived_point, &id_numbers[i], &secrets1[j][i], &secrets2[j][i], &publics[j]).unwrap());
+				})
+		});
 
 		// data, generated during keys generation
 		let public_shares: Vec<_> = (0..n).map(|i| compute_public_share(&polynoms1[i][0]).unwrap()).collect();
@@ -697,7 +701,7 @@ pub mod tests {
 		// === required to generate shares of inv(x) mod r with out revealing
 		// === any information about x or inv(x).
 		// === https://www.researchgate.net/publication/280531698_Robust_Threshold_Elliptic_Curve_Digital_Signature
-	
+
 		// generate shared random secret e for given t
 		let n = artifacts.id_numbers.len();
 		assert!(t * 2 + 1 <= n);

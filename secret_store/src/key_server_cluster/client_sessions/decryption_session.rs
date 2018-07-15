@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -154,7 +154,7 @@ impl SessionImpl {
 		if let Some(key_share) = params.key_share.as_ref() {
 			// encrypted data must be set
 			if key_share.common_point.is_none() || key_share.encrypted_point.is_none() {
-				return Err(Error::NotStartedSessionId);
+				return Err(Error::DocumentKeyIsNotFound);
 			}
 		}
 
@@ -290,7 +290,7 @@ impl SessionImpl {
 		// check if version exists
 		let key_version = match self.core.key_share.as_ref() {
 			None => return Err(Error::InvalidMessage),
-			Some(key_share) => key_share.version(&version).map_err(|e| Error::KeyStorage(e.into()))?,
+			Some(key_share) => key_share.version(&version)?,
 		};
 
 		let mut data = self.data.lock();
@@ -337,7 +337,7 @@ impl SessionImpl {
 			&DecryptionMessage::PartialDecryption(ref message) =>
 				self.on_partial_decryption(sender, message),
 			&DecryptionMessage::DecryptionSessionError(ref message) =>
-				self.process_node_error(Some(&sender), Error::Io(message.error.clone())),
+				self.process_node_error(Some(&sender), message.error.clone()),
 			&DecryptionMessage::DecryptionSessionCompleted(ref message) =>
 				self.on_session_completed(sender, message),
 			&DecryptionMessage::DecryptionSessionDelegation(ref message) =>
@@ -432,8 +432,7 @@ impl SessionImpl {
 		};
 
 		let mut data = self.data.lock();
-		let key_version = key_share.version(data.version.as_ref().ok_or(Error::InvalidMessage)?)
-			.map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
+		let key_version = key_share.version(data.version.as_ref().ok_or(Error::InvalidMessage)?)?.hash.clone();
 		let requester_public = data.consensus_session.consensus_job().executor().requester()
 			.ok_or(Error::InvalidStateForRequest)?
 			.public(&self.core.meta.id)
@@ -564,7 +563,7 @@ impl SessionImpl {
 
 		match {
 			match node {
-				Some(node) => data.consensus_session.on_node_error(node),
+				Some(node) => data.consensus_session.on_node_error(node, error.clone()),
 				None => data.consensus_session.on_session_timeout(),
 			}
 		} {
@@ -601,7 +600,7 @@ impl SessionImpl {
 			Some(key_share) => key_share,
 		};
 
-		let key_version = key_share.version(version).map_err(|e| Error::KeyStorage(e.into()))?.hash.clone();
+		let key_version = key_share.version(version)?.hash.clone();
 		let requester = data.consensus_session.consensus_job().executor().requester().ok_or(Error::InvalidStateForRequest)?.clone();
 		let requester_public = requester.public(&core.meta.id).map_err(Error::InsufficientRequesterData)?;
 		let consensus_group = data.consensus_session.select_consensus_group()?.clone();
@@ -637,6 +636,8 @@ impl SessionImpl {
 			master_node_id: core.meta.self_node_id.clone(),
 			self_node_id: core.meta.self_node_id.clone(),
 			threshold: core.meta.threshold,
+			configured_nodes_count: core.meta.configured_nodes_count,
+			connected_nodes_count: core.meta.connected_nodes_count,
 		}, job, transport);
 		job_session.initialize(consensus_group, self_response, core.meta.self_node_id != core.meta.master_node_id)?;
 		data.broadcast_job_session = Some(job_session);
@@ -812,6 +813,28 @@ impl JobTransport for DecryptionJobTransport {
 }
 
 #[cfg(test)]
+pub fn create_default_decryption_session() -> Arc<SessionImpl> {
+	use acl_storage::DummyAclStorage;
+	use key_server_cluster::cluster::tests::DummyCluster;
+
+	Arc::new(SessionImpl::new(SessionParams {
+		meta: SessionMeta {
+			id: Default::default(),
+			self_node_id: Default::default(),
+			master_node_id: Default::default(),
+			threshold: 0,
+			configured_nodes_count: 0,
+			connected_nodes_count: 0,
+		},
+		access_key: Secret::zero(),
+		key_share: Default::default(),
+		acl_storage: Arc::new(DummyAclStorage::default()),
+		cluster: Arc::new(DummyCluster::new(Default::default())),
+		nonce: 0,
+	}, Some(Requester::Public(2.into()))).unwrap())
+}
+
+#[cfg(test)]
 mod tests {
 	use std::sync::Arc;
 	use std::collections::{BTreeMap, VecDeque};
@@ -881,6 +904,8 @@ mod tests {
 				self_node_id: id_numbers.iter().nth(i).clone().unwrap().0,
 				master_node_id: id_numbers.iter().nth(0).clone().unwrap().0,
 				threshold: encrypted_datas[i].threshold,
+				configured_nodes_count: 5,
+				connected_nodes_count: 5,
 			},
 			access_key: access_key.clone(),
 			key_share: Some(encrypted_datas[i].clone()),
@@ -944,6 +969,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 0,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: Some(DocumentKeyShare {
@@ -976,6 +1003,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 0,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: None,
@@ -998,6 +1027,8 @@ mod tests {
 				self_node_id: self_node_id.clone(),
 				master_node_id: self_node_id.clone(),
 				threshold: 2,
+				configured_nodes_count: 1,
+				connected_nodes_count: 1,
 			},
 			access_key: Random.generate().unwrap().secret().clone(),
 			key_share: Some(DocumentKeyShare {
@@ -1131,7 +1162,7 @@ mod tests {
 		let (_, _, _, sessions) = prepare_decryption_sessions();
 		assert!(sessions[0].decrypted_secret().is_none());
 		sessions[0].on_session_timeout();
-		assert_eq!(sessions[0].decrypted_secret().unwrap().unwrap_err(), Error::ConsensusUnreachable);
+		assert_eq!(sessions[0].decrypted_secret().unwrap().unwrap_err(), Error::ConsensusTemporaryUnreachable);
 	}
 
 	#[test]
@@ -1141,7 +1172,7 @@ mod tests {
 
 		// 1 node disconnects => we still can recover secret
 		sessions[0].on_node_timeout(sessions[1].node());
-		assert!(sessions[0].data.lock().consensus_session.consensus_job().rejects().contains(sessions[1].node()));
+		assert!(sessions[0].data.lock().consensus_session.consensus_job().rejects().contains_key(sessions[1].node()));
 		assert!(sessions[0].state() == ConsensusSessionState::EstablishingConsensus);
 
 		// 2 node are disconnected => we can not recover secret
@@ -1208,7 +1239,7 @@ mod tests {
 		let disconnected = sessions[0].data.lock().consensus_session.computation_job().requests().iter().cloned().nth(0).unwrap();
 		sessions[0].on_node_timeout(&disconnected);
 		assert_eq!(sessions[0].state(), ConsensusSessionState::EstablishingConsensus);
-		assert!(sessions[0].data.lock().consensus_session.computation_job().rejects().contains(&disconnected));
+		assert!(sessions[0].data.lock().consensus_session.computation_job().rejects().contains_key(&disconnected));
 		assert!(!sessions[0].data.lock().consensus_session.computation_job().requests().contains(&disconnected));
 	}
 
@@ -1269,10 +1300,10 @@ mod tests {
 		assert!(decrypted_secret.common_point.is_some());
 		assert!(decrypted_secret.decrypt_shadows.is_some());
 		// check that KS client is able to restore original secret
-		use ethcrypto::DEFAULT_MAC;
-		use ethcrypto::ecies::decrypt;
+		use crypto::DEFAULT_MAC;
+		use ethkey::crypto::ecies::decrypt;
 		let decrypt_shadows: Vec<_> = decrypted_secret.decrypt_shadows.unwrap().into_iter()
-			.map(|c| Secret::from_slice(&decrypt(key_pair.secret(), &DEFAULT_MAC, &c).unwrap()))
+			.map(|c| Secret::from_slice(&decrypt(key_pair.secret(), &DEFAULT_MAC, &c).unwrap()).unwrap())
 			.collect();
 		let decrypted_secret = math::decrypt_with_shadow_coefficients(decrypted_secret.decrypted_secret, decrypted_secret.common_point.unwrap(), decrypt_shadows).unwrap();
 		assert_eq!(decrypted_secret, SECRET_PLAIN.into());
@@ -1413,12 +1444,12 @@ mod tests {
 		assert_eq!(1, sessions.iter().skip(1).filter(|s| s.broadcast_shadows().is_none()).count());
 
 		// 4 nodes must be able to recover original secret
-		use ethcrypto::DEFAULT_MAC;
-		use ethcrypto::ecies::decrypt;
+		use crypto::DEFAULT_MAC;
+		use ethkey::crypto::ecies::decrypt;
 		let result = sessions[0].decrypted_secret().unwrap().unwrap();
 		assert_eq!(3, sessions.iter().skip(1).filter(|s| s.decrypted_secret() == Some(Ok(result.clone()))).count());
 		let decrypt_shadows: Vec<_> = result.decrypt_shadows.unwrap().into_iter()
-			.map(|c| Secret::from_slice(&decrypt(key_pair.secret(), &DEFAULT_MAC, &c).unwrap()))
+			.map(|c| Secret::from_slice(&decrypt(key_pair.secret(), &DEFAULT_MAC, &c).unwrap()).unwrap())
 			.collect();
 		let decrypted_secret = math::decrypt_with_shadow_coefficients(result.decrypted_secret, result.common_point.unwrap(), decrypt_shadows).unwrap();
 		assert_eq!(decrypted_secret, SECRET_PLAIN.into());

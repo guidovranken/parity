@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -18,13 +18,13 @@
 
 use ethereum_types::{U256, U512, Address};
 use bytes::Bytes;
-use trie;
+use ethtrie;
 use vm;
 use trace::{VMTrace, FlatTrace};
 use log_entry::LogEntry;
 use state_diff::StateDiff;
 
-use std::fmt;
+use std::{fmt, error};
 
 /// Transaction execution receipt.
 #[derive(Debug, PartialEq, Clone)]
@@ -117,9 +117,14 @@ pub enum ExecutionError {
 	TransactionMalformed(String),
 }
 
-impl From<Box<trie::TrieError>> for ExecutionError {
-	fn from(err: Box<trie::TrieError>) -> Self {
-		ExecutionError::Internal(format!("{}", err))
+impl From<Box<ethtrie::TrieError>> for ExecutionError {
+	fn from(err: Box<ethtrie::TrieError>) -> Self {
+		ExecutionError::Internal(format!("{:?}", err))
+	}
+}
+impl From<ethtrie::TrieError> for ExecutionError {
+	fn from(err: ethtrie::TrieError) -> Self {
+		ExecutionError::Internal(format!("{:?}", err))
 	}
 }
 
@@ -145,6 +150,12 @@ impl fmt::Display for ExecutionError {
 		};
 
 		f.write_fmt(format_args!("Transaction execution error ({}).", msg))
+	}
+}
+
+impl error::Error for ExecutionError {
+	fn description(&self) -> &str {
+		"Transaction execution error"
 	}
 }
 

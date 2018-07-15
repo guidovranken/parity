@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use parking_lot::RwLock;
-use itertools::Itertools;
+use itertools;
 use ethkey::Address;
 
 use {SafeAccount, Error};
@@ -32,7 +32,7 @@ impl KeyDirectory for MemoryDirectory {
 	fn load(&self) -> Result<Vec<SafeAccount>, Error> {
         /* Fix compilation error -- related to https://github.com/rust-lang/rust/issues/48213 - Guido */
         panic!("not implemented")
-		/*Ok(self.accounts.read().values().cloned().flatten().collect())*/
+		/*Ok(itertools::Itertools::flatten(self.accounts.read().values().cloned()).collect())*/
 	}
 
 	fn update(&self, account: SafeAccount) -> Result<SafeAccount, Error> {
@@ -74,4 +74,3 @@ impl KeyDirectory for MemoryDirectory {
 		Ok(val)
 	}
 }
-

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -14,10 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
-use ethkey::{KeyPair, sign, Address, Signature, Message, Public, Secret};
-use crypto::ecdh::agree;
-use {json, Error, crypto};
+use ethkey::{self, KeyPair, sign, Address, Password, Signature, Message, Public, Secret};
+use ethkey::crypto::ecdh::agree;
+use {json, Error};
 use account::Version;
+use crypto;
 use super::crypto::Crypto;
 
 /// Account representation.
@@ -57,20 +58,20 @@ impl SafeAccount {
 	pub fn create(
 		keypair: &KeyPair,
 		id: [u8; 16],
-		password: &str,
+		password: &Password,
 		iterations: u32,
 		name: String,
 		meta: String
-	) -> Self {
-		SafeAccount {
+	) -> Result<Self, crypto::Error> {
+		Ok(SafeAccount {
 			id: id,
 			version: Version::V3,
-			crypto: Crypto::with_secret(keypair.secret(), password, iterations),
+			crypto: Crypto::with_secret(keypair.secret(), password, iterations)?,
 			address: keypair.address(),
 			filename: None,
 			name: name,
 			meta: meta,
-		}
+		})
 	}
 
 	/// Create a new `SafeAccount` from the given `json`; if it was read from a
@@ -91,7 +92,7 @@ impl SafeAccount {
 	/// Create a new `SafeAccount` from the given vault `json`; if it was read from a
 	/// file, the `filename` should be `Some` name. If it is as yet anonymous, then it
 	/// can be left `None`.
-	pub fn from_vault_file(password: &str, json: json::VaultKeyFile, filename: Option<String>) -> Result<Self, Error> {
+	pub fn from_vault_file(password: &Password, json: json::VaultKeyFile, filename: Option<String>) -> Result<Self, Error> {
 		let meta_crypto: Crypto = json.metacrypto.into();
 		let meta_plain = meta_crypto.decrypt(password)?;
 		let meta_plain = json::VaultKeyMeta::load(&meta_plain).map_err(|e| Error::Custom(format!("{:?}", e)))?;
@@ -107,14 +108,14 @@ impl SafeAccount {
 	}
 
 	/// Create a new `VaultKeyFile` from the given `self`
-	pub fn into_vault_file(self, iterations: u32, password: &str) -> Result<json::VaultKeyFile, Error> {
+	pub fn into_vault_file(self, iterations: u32, password: &Password) -> Result<json::VaultKeyFile, Error> {
 		let meta_plain = json::VaultKeyMeta {
 			address: self.address.into(),
 			name: Some(self.name),
 			meta: Some(self.meta),
 		};
 		let meta_plain = meta_plain.write().map_err(|e| Error::Custom(format!("{:?}", e)))?;
-		let meta_crypto = Crypto::with_plain(&meta_plain, password, iterations);
+		let meta_crypto = Crypto::with_plain(&meta_plain, password, iterations)?;
 
 		Ok(json::VaultKeyFile {
 			id: self.id.into(),
@@ -125,36 +126,36 @@ impl SafeAccount {
 	}
 
 	/// Sign a message.
-	pub fn sign(&self, password: &str, message: &Message) -> Result<Signature, Error> {
+	pub fn sign(&self, password: &Password, message: &Message) -> Result<Signature, Error> {
 		let secret = self.crypto.secret(password)?;
 		sign(&secret, message).map_err(From::from)
 	}
 
 	/// Decrypt a message.
-	pub fn decrypt(&self, password: &str, shared_mac: &[u8], message: &[u8]) -> Result<Vec<u8>, Error> {
+	pub fn decrypt(&self, password: &Password, shared_mac: &[u8], message: &[u8]) -> Result<Vec<u8>, Error> {
 		let secret = self.crypto.secret(password)?;
-		crypto::ecies::decrypt(&secret, shared_mac, message).map_err(From::from)
+		ethkey::crypto::ecies::decrypt(&secret, shared_mac, message).map_err(From::from)
 	}
 
 	/// Agree on shared key.
-	pub fn agree(&self, password: &str, other: &Public) -> Result<Secret, Error> {
+	pub fn agree(&self, password: &Password, other: &Public) -> Result<Secret, Error> {
 		let secret = self.crypto.secret(password)?;
 		agree(&secret, other).map_err(From::from)
 	}
 
 	/// Derive public key.
-	pub fn public(&self, password: &str) -> Result<Public, Error> {
+	pub fn public(&self, password: &Password) -> Result<Public, Error> {
 		let secret = self.crypto.secret(password)?;
 		Ok(KeyPair::from_secret(secret)?.public().clone())
 	}
 
 	/// Change account's password.
-	pub fn change_password(&self, old_password: &str, new_password: &str, iterations: u32) -> Result<Self, Error> {
+	pub fn change_password(&self, old_password: &Password, new_password: &Password, iterations: u32) -> Result<Self, Error> {
 		let secret = self.crypto.secret(old_password)?;
 		let result = SafeAccount {
 			id: self.id.clone(),
 			version: self.version.clone(),
-			crypto: Crypto::with_secret(&secret, new_password, iterations),
+			crypto: Crypto::with_secret(&secret, new_password, iterations)?,
 			address: self.address.clone(),
 			filename: self.filename.clone(),
 			name: self.name.clone(),
@@ -164,7 +165,7 @@ impl SafeAccount {
 	}
 
 	/// Check if password matches the account.
-	pub fn check_password(&self, password: &str) -> bool {
+	pub fn check_password(&self, password: &Password) -> bool {
 		self.crypto.secret(password).is_ok()
 	}
 }
@@ -177,25 +178,25 @@ mod tests {
 	#[test]
 	fn sign_and_verify_public() {
 		let keypair = Random.generate().unwrap();
-		let password = "hello world";
+		let password = "hello world".into();
 		let message = Message::default();
-		let account = SafeAccount::create(&keypair, [0u8; 16], password, 10240, "Test".to_owned(), "{}".to_owned());
-		let signature = account.sign(password, &message).unwrap();
+		let account = SafeAccount::create(&keypair, [0u8; 16], &password, 10240, "Test".to_owned(), "{}".to_owned());
+		let signature = account.unwrap().sign(&password, &message).unwrap();
 		assert!(verify_public(keypair.public(), &signature, &message).unwrap());
 	}
 
 	#[test]
 	fn change_password() {
 		let keypair = Random.generate().unwrap();
-		let first_password = "hello world";
-		let sec_password = "this is sparta";
+		let first_password = "hello world".into();
+		let sec_password = "this is sparta".into();
 		let i = 10240;
 		let message = Message::default();
-		let account = SafeAccount::create(&keypair, [0u8; 16], first_password, i, "Test".to_owned(), "{}".to_owned());
-		let new_account = account.change_password(first_password, sec_password, i).unwrap();
-		assert!(account.sign(first_password, &message).is_ok());
-		assert!(account.sign(sec_password, &message).is_err());
-		assert!(new_account.sign(first_password, &message).is_err());
-		assert!(new_account.sign(sec_password, &message).is_ok());
+		let account = SafeAccount::create(&keypair, [0u8; 16], &first_password, i, "Test".to_owned(), "{}".to_owned()).unwrap();
+		let new_account = account.change_password(&first_password, &sec_password, i).unwrap();
+		assert!(account.sign(&first_password, &message).is_ok());
+		assert!(account.sign(&sec_password, &message).is_err());
+		assert!(new_account.sign(&first_password, &message).is_err());
+		assert!(new_account.sign(&sec_password, &message).is_ok());
 	}
 }

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -145,8 +145,8 @@ mod tests {
 	use account_provider::AccountProvider;
 	use miner::MinerService;
 	use types::ids::BlockId;
+	use test_helpers::generate_dummy_client_with_spec_and_accounts;
 	use client::{BlockChainClient, ChainInfo, BlockInfo, CallContract};
-	use tests::helpers::generate_dummy_client_with_spec_and_accounts;
 	use super::super::ValidatorSet;
 	use super::ValidatorContract;
 
@@ -163,14 +163,14 @@ mod tests {
 	#[test]
 	fn reports_validators() {
 		let tap = Arc::new(AccountProvider::transient_provider());
-		let v1 = tap.insert_account(keccak("1").into(), "").unwrap();
+		let v1 = tap.insert_account(keccak("1").into(), &"".into()).unwrap();
 		let client = generate_dummy_client_with_spec_and_accounts(Spec::new_validator_contract, Some(tap.clone()));
 		client.engine().register_client(Arc::downgrade(&client) as _);
 		let validator_contract = "0000000000000000000000000000000000000005".parse::<Address>().unwrap();
 
 		// Make sure reporting can be done.
-		client.miner().set_gas_floor_target(1_000_000.into());
-		client.miner().set_engine_signer(v1, "".into()).unwrap();
+		client.miner().set_gas_range_target((1_000_000.into(), 1_000_000.into()));
+		client.miner().set_author(v1, Some("".into())).unwrap();
 
 		// Check a block that is a bit in future, reject it but don't report the validator.
 		let mut header = Header::default();

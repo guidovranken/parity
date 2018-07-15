@@ -17,11 +17,21 @@ db_path = "$HOME/.parity/chains"
 keys_path = "$HOME/.parity/keys"
 identity = ""
 light = false
+no_hardcoded_sync = false
 
 [account]
 unlock = ["0xdeadbeefcafe0000000000000000000000000000"]
 password = ["~/.safe/password.file"]
 keys_iterations = 10240
+
+[private_tx]
+enabled = true
+signer = "0xdeadbeefcafe0000000000000000000000000000"
+validators = ["0xdeadbeefcafe0000000000000000000000000000"]
+passwords = "~/.safe/password.file"
+account = "0xdeadbeefcafe0000000000000000000000000000"
+sstore_url = "http://localhost:8082"
+sstore_threshold = 0
 
 [ui]
 force = false
@@ -81,12 +91,13 @@ pass = "test_pass"
 [secretstore]
 disable = false
 disable_http = false
-disable_acl_check = false
+acl_contract = "registry"
 service_contract = "none"
 service_contract_srv_gen = "none"
 service_contract_srv_retr = "none"
 service_contract_doc_store = "none"
 service_contract_doc_sretr = "none"
+server_set_contract = "registry"
 nodes = []
 http_interface = "local"
 http_port = 8082
@@ -123,6 +134,7 @@ tx_queue_ban_count = 1
 tx_queue_ban_time = 180 #s
 tx_gas_limit = "6283184"
 tx_time_limit = 100 #ms
+tx_queue_no_unfamiliar_locals = false
 extra_data = "Parity"
 remove_solved = false
 notify_work = ["http://localhost:3001"]
@@ -138,7 +150,6 @@ cache_size_blocks = 8
 cache_size_queue = 50
 cache_size_state = 25
 cache_size = 128 # Overrides above caches with total size
-fast_and_loose = false
 db_compaction = "ssd"
 fat_db = "auto"
 scale_verifiers = true
@@ -146,9 +157,6 @@ num_verifiers = 6
 
 [snapshots]
 disable_periodic = false
-
-[vm]
-jit = false
 
 [misc]
 logging = "own_tx=trace"

@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -21,13 +21,15 @@ use ethereum_types::{U256, Address};
 
 use ethcore::miner::MinerService;
 use ethcore::client::TestBlockChainClient;
-use ethsync::ManageNetwork;
+use sync::ManageNetwork;
 use futures_cpupool::CpuPool;
 
 use jsonrpc_core::IoHandler;
 use v1::{ParitySet, ParitySetClient};
-use v1::tests::helpers::{TestMinerService, TestFetch, TestUpdater, TestDappsService};
+use v1::tests::helpers::{TestMinerService, TestUpdater};
 use super::manage_network::TestManageNetwork;
+
+use fake_fetch::FakeFetch;
 
 fn miner_service() -> Arc<TestMinerService> {
 	Arc::new(TestMinerService::default())
@@ -45,7 +47,7 @@ fn updater_service() -> Arc<TestUpdater> {
 	Arc::new(TestUpdater::default())
 }
 
-pub type TestParitySetClient = ParitySetClient<TestBlockChainClient, TestMinerService, TestUpdater, TestFetch>;
+pub type TestParitySetClient = ParitySetClient<TestBlockChainClient, TestMinerService, TestUpdater, FakeFetch<usize>>;
 
 fn parity_set_client(
 	client: &Arc<TestBlockChainClient>,
@@ -53,9 +55,8 @@ fn parity_set_client(
 	updater: &Arc<TestUpdater>,
 	net: &Arc<TestManageNetwork>,
 ) -> TestParitySetClient {
-	let dapps_service = Arc::new(TestDappsService);
 	let pool = CpuPool::new(1);
-	ParitySetClient::new(client, miner, updater, &(net.clone() as Arc<ManageNetwork>), Some(dapps_service), TestFetch::default(), pool)
+	ParitySetClient::new(client, miner, updater, &(net.clone() as Arc<ManageNetwork>), FakeFetch::new(Some(1)), pool)
 }
 
 #[test]
@@ -107,10 +108,9 @@ fn rpc_parity_set_min_gas_price() {
 	io.extend_with(parity_set_client(&client, &miner, &updater, &network).to_delegate());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_setMinGasPrice", "params":["0xcd1722f3947def4cf144679da39c4c32bdc35681"], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":false,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.minimal_gas_price(), U256::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
 }
 
 #[test]
@@ -127,7 +127,7 @@ fn rpc_parity_set_gas_floor_target() {
 	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.gas_floor_target(), U256::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
+	assert_eq!(miner.authoring_params().gas_range_target.0, U256::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn rpc_parity_set_extra_data() {
 	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.extra_data(), "cd1722f3947def4cf144679da39c4c32bdc35681".from_hex().unwrap());
+	assert_eq!(miner.authoring_params().extra_data, "cd1722f3947def4cf144679da39c4c32bdc35681".from_hex().unwrap());
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn rpc_parity_set_author() {
 	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.author(), Address::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
+	assert_eq!(miner.authoring_params().author, Address::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
 }
 
 #[test]
@@ -176,10 +176,9 @@ fn rpc_parity_set_engine_signer() {
 	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.author(), Address::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
-	assert_eq!(*miner.password.read(), "password".to_string());
+	assert_eq!(miner.authoring_params().author, Address::from_str("cd1722f3947def4cf144679da39c4c32bdc35681").unwrap());
+	assert_eq!(*miner.password.read(), "password".into());
 }
-
 
 #[test]
 fn rpc_parity_set_transactions_limit() {
@@ -191,10 +190,9 @@ fn rpc_parity_set_transactions_limit() {
 	io.extend_with(parity_set_client(&client, &miner, &updater, &network).to_delegate());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_setTransactionsLimit", "params":[10240240], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":true,"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","result":false,"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
-	assert_eq!(miner.transactions_limit(), 10_240_240);
 }
 
 #[test]
@@ -251,7 +249,7 @@ fn rpc_parity_set_dapps_list() {
 	io.extend_with(parity_set_client(&client, &miner, &updater, &network).to_delegate());
 
 	let request = r#"{"jsonrpc": "2.0", "method": "parity_dappsList", "params":[], "id": 1}"#;
-	let response = r#"{"jsonrpc":"2.0","result":[{"author":"Parity Technologies Ltd","description":"A skeleton dapp","iconUrl":"title.png","id":"skeleton","localUrl":null,"name":"Skeleton","version":"0.1"}],"id":1}"#;
+	let response = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"Dapps Server is disabled. This API is not available."},"id":1}"#;
 
 	assert_eq!(io.handle_request_sync(request), Some(response.to_owned()));
 }

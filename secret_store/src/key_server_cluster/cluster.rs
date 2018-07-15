@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -84,6 +84,8 @@ pub trait ClusterClient: Send + Sync {
 	fn add_generation_listener(&self, listener: Arc<ClusterSessionsListener<GenerationSession>>);
 	/// Listen for new decryption sessions.
 	fn add_decryption_listener(&self, listener: Arc<ClusterSessionsListener<DecryptionSession>>);
+	/// Listen for new key version negotiation sessions.
+	fn add_key_version_negotiation_listener(&self, listener: Arc<ClusterSessionsListener<KeyVersionNegotiationSession<KeyVersionNegotiationSessionTransport>>>);
 
 	/// Ask node to make 'faulty' generation sessions.
 	#[cfg(test)]
@@ -109,6 +111,10 @@ pub trait Cluster: Send + Sync {
 	fn is_connected(&self, node: &NodeId) -> bool;
 	/// Get a set of connected nodes.
 	fn nodes(&self) -> BTreeSet<NodeId>;
+	/// Get total count of configured key server nodes (valid at the time of ClusterView creation).
+	fn configured_nodes_count(&self) -> usize;
+	/// Get total count of connected key server nodes (valid at the time of ClusterView creation).
+	fn connected_nodes_count(&self) -> usize;
 }
 
 /// Cluster initialization parameters.
@@ -160,6 +166,8 @@ pub struct ClusterClientImpl {
 /// Network cluster view. It is a communication channel, required in single session.
 pub struct ClusterView {
 	core: Arc<Mutex<ClusterViewCore>>,
+	configured_nodes_count: usize,
+	connected_nodes_count: usize,
 }
 
 /// Cross-thread shareable cluster data.
@@ -192,9 +200,10 @@ pub struct ClusterConnections {
 	pub data: RwLock<ClusterConnectionsData>,
 }
 
-#[derive(Default)]
 /// Cluster connections data.
 pub struct ClusterConnectionsData {
+	/// Is this node isolated from cluster?
+	pub is_isolated: bool,
 	/// Active key servers set.
 	pub nodes: BTreeMap<Public, SocketAddr>,
 	/// Active connections to key servers.
@@ -378,6 +387,9 @@ impl ClusterCore {
 		for connection in data.connections.active_connections() {
 			let last_message_diff = Instant::now() - connection.last_message_time();
 			if last_message_diff > KEEP_ALIVE_DISCONNECT_INTERVAL {
+				warn!(target: "secretstore_net", "{}: keep alive timeout for node {}",
+					data.self_key_pair.public(), connection.node_id());
+
 				data.connections.remove(data.clone(), connection.node_id(), connection.is_inbound());
 				data.sessions.on_connection_timeout(connection.node_id());
 			}
@@ -478,7 +490,7 @@ impl ClusterCore {
 			if is_master_node && session.is_finished() {
 				data.sessions.negotiation_sessions.remove(&session.id());
 				match session.wait() {
-					Ok((version, master)) => match session.take_continue_action() {
+					Ok(Some((version, master))) => match session.take_continue_action() {
 						Some(ContinueAction::Decrypt(session, origin, is_shadow_decryption, is_broadcast_decryption)) => {
 							let initialization_error = if data.self_key_pair.public() == &master {
 								session.initialize(origin, version, is_shadow_decryption, is_broadcast_decryption)
@@ -517,18 +529,19 @@ impl ClusterCore {
 						},
 						None => (),
 					},
+					Ok(None) => unreachable!("is_master_node; session is finished; negotiation version always finished with result on master; qed"),
 					Err(error) => match session.take_continue_action() {
 						Some(ContinueAction::Decrypt(session, _, _, _)) => {
-							data.sessions.decryption_sessions.remove(&session.id());
 							session.on_session_error(&meta.self_node_id, error);
+							data.sessions.decryption_sessions.remove(&session.id());
 						},
 						Some(ContinueAction::SchnorrSign(session, _)) => {
-							data.sessions.schnorr_signing_sessions.remove(&session.id());
 							session.on_session_error(&meta.self_node_id, error);
+							data.sessions.schnorr_signing_sessions.remove(&session.id());
 						},
 						Some(ContinueAction::EcdsaSign(session, _)) => {
-							data.sessions.ecdsa_signing_sessions.remove(&session.id());
 							session.on_session_error(&meta.self_node_id, error);
+							data.sessions.ecdsa_signing_sessions.remove(&session.id());
 						},
 						None => (),
 					},
@@ -554,7 +567,7 @@ impl ClusterCore {
 		let is_initialization_message = message.is_initialization_message();
 		let is_delegation_message = message.is_delegation_message();
 		match is_initialization_message || is_delegation_message {
-			false => sessions.get(&session_id, true).ok_or(Error::InvalidSessionId),
+			false => sessions.get(&session_id, true).ok_or(Error::NoActiveSessionWithId),
 			true => {
 				let creation_data = SC::creation_data_from_message(&message)?;
 				let master = if is_initialization_message { sender.clone() } else { data.self_key_pair.public().clone() };
@@ -647,12 +660,12 @@ impl ClusterCore {
 impl ClusterConnections {
 	pub fn new(config: &ClusterConfiguration) -> Result<Self, Error> {
 		let mut nodes = config.key_server_set.snapshot().current_set;
-		nodes.remove(config.self_key_pair.public());
+		let is_isolated = nodes.remove(config.self_key_pair.public()).is_none();
 
 		let trigger: Box<ConnectionTrigger> = match config.auto_migrate_enabled {
 			false => Box::new(SimpleConnectionTrigger::new(config.key_server_set.clone(), config.self_key_pair.clone(), config.admin_public.clone())),
 			true if config.admin_public.is_none() => Box::new(ConnectionTriggerWithMigration::new(config.key_server_set.clone(), config.self_key_pair.clone())),
-			true => return Err(Error::Io("secret store admininstrator public key is specified with auto-migration enabled".into())), // TODO [Refac]: Io -> Internal
+			true => return Err(Error::Internal("secret store admininstrator public key is specified with auto-migration enabled".into())),
 		};
 		let connector = trigger.servers_set_change_creator_connector();
 
@@ -662,6 +675,7 @@ impl ClusterConnections {
 			trigger: Mutex::new(trigger),
 			connector: connector,
 			data: RwLock::new(ClusterConnectionsData {
+				is_isolated: is_isolated,
 				nodes: nodes,
 				connections: BTreeMap::new(),
 			}),
@@ -728,8 +742,13 @@ impl ClusterConnections {
 		self.maintain_connection_trigger(maintain_action, data);
 	}
 
-	pub fn connected_nodes(&self) -> BTreeSet<NodeId> {
-		self.data.read().connections.keys().cloned().collect()
+	pub fn connected_nodes(&self) -> Result<BTreeSet<NodeId>, Error> {
+		let data = self.data.read();
+		if data.is_isolated {
+			return Err(Error::NodeDisconnected);
+		}
+
+		Ok(data.connections.keys().cloned().collect())
 	}
 
 	pub fn active_connections(&self)-> Vec<Arc<Connection>> {
@@ -835,8 +854,10 @@ impl Connection {
 }
 
 impl ClusterView {
-	pub fn new(cluster: Arc<ClusterData>, nodes: BTreeSet<NodeId>) -> Self {
+	pub fn new(cluster: Arc<ClusterData>, nodes: BTreeSet<NodeId>, configured_nodes_count: usize) -> Self {
 		ClusterView {
+			configured_nodes_count: configured_nodes_count,
+			connected_nodes_count: nodes.len(),
 			core: Arc::new(Mutex::new(ClusterViewCore {
 				cluster: cluster,
 				nodes: nodes,
@@ -871,6 +892,14 @@ impl Cluster for ClusterView {
 	fn nodes(&self) -> BTreeSet<NodeId> {
 		self.core.lock().nodes.clone()
 	}
+
+	fn configured_nodes_count(&self) -> usize {
+		self.configured_nodes_count
+	}
+
+	fn connected_nodes_count(&self) -> usize {
+		self.connected_nodes_count
+	}
 }
 
 impl ClusterClientImpl {
@@ -881,7 +910,7 @@ impl ClusterClientImpl {
 	}
 
 	fn create_key_version_negotiation_session(&self, session_id: SessionId) -> Result<Arc<KeyVersionNegotiationSession<KeyVersionNegotiationSessionTransport>>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let access_key = Random.generate()?.secret().clone();
@@ -896,6 +925,20 @@ impl ClusterClientImpl {
 			}
 		}
 	}
+
+	fn process_initialization_result<S: ClusterSession, SC: ClusterSessionCreator<S, D>, D>(result: Result<(), Error>, session: Arc<S>, sessions: &ClusterSessionsContainer<S, SC, D>) -> Result<Arc<S>, Error> {
+		match result {
+			Ok(()) if session.is_finished() => {
+				sessions.remove(&session.id());
+				Ok(session)
+			},
+			Ok(()) => Ok(session),
+			Err(error) => {
+				sessions.remove(&session.id());
+				Err(error)
+			},
+		}
+	}
 }
 
 impl ClusterClient for ClusterClientImpl {
@@ -904,37 +947,29 @@ impl ClusterClient for ClusterClientImpl {
 	}
 
 	fn new_generation_session(&self, session_id: SessionId, origin: Option<Address>, author: Address, threshold: usize) -> Result<Arc<GenerationSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let cluster = create_cluster_view(&self.data, true)?;
 		let session = self.data.sessions.generation_sessions.insert(cluster, self.data.self_key_pair.public().clone(), session_id, None, false, None)?;
-		match session.initialize(origin, author, false, threshold, connected_nodes.into()) {
-			Ok(()) => Ok(session),
-			Err(error) => {
-				self.data.sessions.generation_sessions.remove(&session.id());
-				Err(error)
-			},
-		}
+		Self::process_initialization_result(
+			session.initialize(origin, author, false, threshold, connected_nodes.into()),
+			session, &self.data.sessions.generation_sessions)
 	}
 
 	fn new_encryption_session(&self, session_id: SessionId, requester: Requester, common_point: Public, encrypted_point: Public) -> Result<Arc<EncryptionSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let cluster = create_cluster_view(&self.data, true)?;
 		let session = self.data.sessions.encryption_sessions.insert(cluster, self.data.self_key_pair.public().clone(), session_id, None, false, None)?;
-		match session.initialize(requester, common_point, encrypted_point) {
-			Ok(()) => Ok(session),
-			Err(error) => {
-				self.data.sessions.encryption_sessions.remove(&session.id());
-				Err(error)
-			},
-		}
+		Self::process_initialization_result(
+			session.initialize(requester, common_point, encrypted_point),
+			session, &self.data.sessions.encryption_sessions)
 	}
 
 	fn new_decryption_session(&self, session_id: SessionId, origin: Option<Address>, requester: Requester, version: Option<H256>, is_shadow_decryption: bool, is_broadcast_decryption: bool) -> Result<Arc<DecryptionSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let access_key = Random.generate()?.secret().clone();
@@ -954,17 +989,13 @@ impl ClusterClient for ClusterClientImpl {
 			},
 		};
 
-		match initialization_result {
-			Ok(()) => Ok(session),
-			Err(error) => {
-				self.data.sessions.decryption_sessions.remove(&session.id());
-				Err(error)
-			},
-		}
+		Self::process_initialization_result(
+			initialization_result,
+			session, &self.data.sessions.decryption_sessions)
 	}
 
 	fn new_schnorr_signing_session(&self, session_id: SessionId, requester: Requester, version: Option<H256>, message_hash: H256) -> Result<Arc<SchnorrSigningSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let access_key = Random.generate()?.secret().clone();
@@ -983,17 +1014,13 @@ impl ClusterClient for ClusterClientImpl {
 			},
 		};
 
-		match initialization_result {
-			Ok(()) => Ok(session),
-			Err(error) => {
-				self.data.sessions.schnorr_signing_sessions.remove(&session.id());
-				Err(error)
-			},
-		}
+		Self::process_initialization_result(
+			initialization_result,
+			session, &self.data.sessions.schnorr_signing_sessions)
 	}
 
 	fn new_ecdsa_signing_session(&self, session_id: SessionId, requester: Requester, version: Option<H256>, message_hash: H256) -> Result<Arc<EcdsaSigningSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let access_key = Random.generate()?.secret().clone();
@@ -1012,13 +1039,9 @@ impl ClusterClient for ClusterClientImpl {
 			},
 		};
 
-		match initialization_result {
-			Ok(()) => Ok(session),
-			Err(error) => {
-				self.data.sessions.ecdsa_signing_sessions.remove(&session.id());
-				Err(error)
-			},
-		}
+		Self::process_initialization_result(
+			initialization_result,
+			session, &self.data.sessions.ecdsa_signing_sessions)
 	}
 
 	fn new_key_version_negotiation_session(&self, session_id: SessionId) -> Result<Arc<KeyVersionNegotiationSession<KeyVersionNegotiationSessionTransport>>, Error> {
@@ -1027,7 +1050,7 @@ impl ClusterClient for ClusterClientImpl {
 	}
 
 	fn new_servers_set_change_session(&self, session_id: Option<SessionId>, migration_id: Option<H256>, new_nodes_set: BTreeSet<NodeId>, old_set_signature: Signature, new_set_signature: Signature) -> Result<Arc<AdminSession>, Error> {
-		let mut connected_nodes = self.data.connections.connected_nodes();
+		let mut connected_nodes = self.data.connections.connected_nodes()?;
 		connected_nodes.insert(self.data.self_key_pair.public().clone());
 
 		let session_id = match session_id {
@@ -1042,16 +1065,13 @@ impl ClusterClient for ClusterClientImpl {
 		let initialization_result = session.as_servers_set_change().expect("servers set change session is created; qed")
 			.initialize(new_nodes_set, old_set_signature, new_set_signature);
 
-		match initialization_result {
-			Ok(()) => {
-				self.data.connections.servers_set_change_creator_connector().set_key_servers_set_change_session(session.clone());
-				Ok(session)
-			},
-			Err(error) => {
-				self.data.sessions.admin_sessions.remove(&session.id());
-				Err(error)
-			},
+		if initialization_result.is_ok() {
+			self.data.connections.servers_set_change_creator_connector().set_key_servers_set_change_session(session.clone());
 		}
+
+		Self::process_initialization_result(
+			initialization_result,
+			session, &self.data.sessions.admin_sessions)
 	}
 
 	fn add_generation_listener(&self, listener: Arc<ClusterSessionsListener<GenerationSession>>) {
@@ -1060,6 +1080,10 @@ impl ClusterClient for ClusterClientImpl {
 
 	fn add_decryption_listener(&self, listener: Arc<ClusterSessionsListener<DecryptionSession>>) {
 		self.data.sessions.decryption_sessions.add_listener(listener);
+	}
+
+	fn add_key_version_negotiation_listener(&self, listener: Arc<ClusterSessionsListener<KeyVersionNegotiationSession<KeyVersionNegotiationSessionTransport>>>) {
+		self.data.sessions.negotiation_sessions.add_listener(listener);
 	}
 
 	#[cfg(test)]
@@ -1134,7 +1158,7 @@ pub mod tests {
 		fn cluster_state(&self) -> ClusterState { unimplemented!("test-only") }
 		fn new_generation_session(&self, _session_id: SessionId, _origin: Option<Address>, _author: Address, _threshold: usize) -> Result<Arc<GenerationSession>, Error> {
 			self.generation_requests_count.fetch_add(1, Ordering::Relaxed);
-			Err(Error::Io("test-errror".into()))
+			Err(Error::Internal("test-error".into()))
 		}
 		fn new_encryption_session(&self, _session_id: SessionId, _requester: Requester, _common_point: Public, _encrypted_point: Public) -> Result<Arc<EncryptionSession>, Error> { unimplemented!("test-only") }
 		fn new_decryption_session(&self, _session_id: SessionId, _origin: Option<Address>, _requester: Requester, _version: Option<H256>, _is_shadow_decryption: bool, _is_broadcast_session: bool) -> Result<Arc<DecryptionSession>, Error> { unimplemented!("test-only") }
@@ -1146,6 +1170,7 @@ pub mod tests {
 
 		fn add_generation_listener(&self, _listener: Arc<ClusterSessionsListener<GenerationSession>>) {}
 		fn add_decryption_listener(&self, _listener: Arc<ClusterSessionsListener<DecryptionSession>>) {}
+		fn add_key_version_negotiation_listener(&self, _listener: Arc<ClusterSessionsListener<KeyVersionNegotiationSession<KeyVersionNegotiationSessionTransport>>>) {}
 
 		fn make_faulty_generation_sessions(&self) { unimplemented!("test-only") }
 		fn generation_session(&self, _session_id: &SessionId) -> Option<Arc<GenerationSession>> { unimplemented!("test-only") }
@@ -1206,6 +1231,14 @@ pub mod tests {
 		fn nodes(&self) -> BTreeSet<NodeId> {
 			self.data.lock().nodes.iter().cloned().collect()
 		}
+
+		fn configured_nodes_count(&self) -> usize {
+			self.data.lock().nodes.len()
+		}
+
+		fn connected_nodes_count(&self) -> usize {
+			self.data.lock().nodes.len()
+		}
 	}
 
 	pub fn loop_until<F>(core: &mut Core, timeout: Duration, predicate: F) where F: Fn() -> bool {
@@ -1234,7 +1267,7 @@ pub mod tests {
 			threads: 1,
 			self_key_pair: Arc::new(PlainNodeKeyPair::new(key_pairs[i].clone())),
 			listen_address: ("127.0.0.1".to_owned(), ports_begin + i as u16),
-			key_server_set: Arc::new(MapKeyServerSet::new(key_pairs.iter().enumerate()
+			key_server_set: Arc::new(MapKeyServerSet::new(false, key_pairs.iter().enumerate()
 				.map(|(j, kp)| (kp.public().clone(), format!("127.0.0.1:{}", ports_begin + j as u16).parse().unwrap()))
 				.collect())),
 			allow_connecting_to_higher_nodes: false,
@@ -1374,11 +1407,11 @@ pub mod tests {
 		{
 			// try to start generation session => fail in initialization
 			assert_eq!(clusters[0].client().new_generation_session(SessionId::default(), Default::default(), Default::default(), 100).map(|_| ()),
-				Err(Error::InvalidThreshold));
+				Err(Error::NotEnoughNodesForThreshold));
 
 			// try to start generation session => fails in initialization
 			assert_eq!(clusters[0].client().new_generation_session(SessionId::default(), Default::default(), Default::default(), 100).map(|_| ()),
-				Err(Error::InvalidThreshold));
+				Err(Error::NotEnoughNodesForThreshold));
 
 			assert!(clusters[0].data.sessions.generation_sessions.is_empty());
 		}

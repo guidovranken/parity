@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -17,11 +17,11 @@
 /// Parity-specific rpc interface for operations altering the settings.
 use std::io;
 use std::sync::Arc;
+use std::time::Duration;
 
+use ethcore::client::{BlockChainClient, Mode};
 use ethcore::miner::MinerService;
-use ethcore::client::MiningBlockChainClient;
-use ethcore::mode::Mode;
-use ethsync::ManageNetwork;
+use sync::ManageNetwork;
 use fetch::{self, Fetch};
 use futures_cpupool::CpuPool;
 use hash::keccak_buffer;
@@ -29,7 +29,6 @@ use updater::{Service as UpdateService};
 
 use jsonrpc_core::{BoxFuture, Result};
 use jsonrpc_core::futures::Future;
-use v1::helpers::dapps::DappsService;
 use v1::helpers::errors;
 use v1::traits::ParitySet;
 use v1::types::{Bytes, H160, H256, U256, ReleaseInfo, Transaction, LocalDapp};
@@ -40,14 +39,13 @@ pub struct ParitySetClient<C, M, U, F = fetch::Client> {
 	miner: Arc<M>,
 	updater: Arc<U>,
 	net: Arc<ManageNetwork>,
-	dapps: Option<Arc<DappsService>>,
 	fetch: F,
 	pool: CpuPool,
 	eip86_transition: u64,
 }
 
 impl<C, M, U, F> ParitySetClient<C, M, U, F>
-	where C: MiningBlockChainClient + 'static,
+	where C: BlockChainClient + 'static,
 {
 	/// Creates new `ParitySetClient` with given `Fetch`.
 	pub fn new(
@@ -55,7 +53,6 @@ impl<C, M, U, F> ParitySetClient<C, M, U, F>
 		miner: &Arc<M>,
 		updater: &Arc<U>,
 		net: &Arc<ManageNetwork>,
-		dapps: Option<Arc<DappsService>>,
 		fetch: F,
 		pool: CpuPool,
 	) -> Self {
@@ -64,7 +61,6 @@ impl<C, M, U, F> ParitySetClient<C, M, U, F>
 			miner: miner.clone(),
 			updater: updater.clone(),
 			net: net.clone(),
-			dapps: dapps,
 			fetch: fetch,
 			pool: pool,
 			eip86_transition: client.eip86_transition(),
@@ -73,24 +69,38 @@ impl<C, M, U, F> ParitySetClient<C, M, U, F>
 }
 
 impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
-	C: MiningBlockChainClient + 'static,
+	C: BlockChainClient + 'static,
 	M: MinerService + 'static,
 	U: UpdateService + 'static,
 	F: Fetch + 'static,
 {
 
-	fn set_min_gas_price(&self, gas_price: U256) -> Result<bool> {
-		self.miner.set_minimal_gas_price(gas_price.into());
-		Ok(true)
+	fn set_min_gas_price(&self, _gas_price: U256) -> Result<bool> {
+		warn!("setMinGasPrice is deprecated. Ignoring request.");
+		Ok(false)
+	}
+
+	fn set_transactions_limit(&self, _limit: usize) -> Result<bool> {
+		warn!("setTransactionsLimit is deprecated. Ignoring request.");
+		Ok(false)
+	}
+
+	fn set_tx_gas_limit(&self, _limit: U256) -> Result<bool> {
+		warn!("setTxGasLimit is deprecated. Ignoring request.");
+		Ok(false)
 	}
 
 	fn set_gas_floor_target(&self, target: U256) -> Result<bool> {
-		self.miner.set_gas_floor_target(target.into());
+		let mut range = self.miner.authoring_params().gas_range_target.clone();
+		range.0 = target.into();
+		self.miner.set_gas_range_target(range);
 		Ok(true)
 	}
 
 	fn set_gas_ceil_target(&self, target: U256) -> Result<bool> {
-		self.miner.set_gas_ceil_target(target.into());
+		let mut range = self.miner.authoring_params().gas_range_target.clone();
+		range.1 = target.into();
+		self.miner.set_gas_range_target(range);
 		Ok(true)
 	}
 
@@ -99,23 +109,13 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 		Ok(true)
 	}
 
-	fn set_author(&self, author: H160) -> Result<bool> {
-		self.miner.set_author(author.into());
+	fn set_author(&self, address: H160) -> Result<bool> {
+		self.miner.set_author(address.into(), None).map_err(Into::into).map_err(errors::password)?;
 		Ok(true)
 	}
 
 	fn set_engine_signer(&self, address: H160, password: String) -> Result<bool> {
-		self.miner.set_engine_signer(address.into(), password).map_err(Into::into).map_err(errors::password)?;
-		Ok(true)
-	}
-
-	fn set_transactions_limit(&self, limit: usize) -> Result<bool> {
-		self.miner.set_transactions_limit(limit);
-		Ok(true)
-	}
-
-	fn set_tx_gas_limit(&self, limit: U256) -> Result<bool> {
-		self.miner.set_tx_gas_limit(limit.into());
+		self.miner.set_author(address.into(), Some(password.into())).map_err(Into::into).map_err(errors::password)?;
 		Ok(true)
 	}
 
@@ -156,8 +156,8 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 	fn set_mode(&self, mode: String) -> Result<bool> {
 		self.client.set_mode(match mode.as_str() {
 			"offline" => Mode::Off,
-			"dark" => Mode::Dark(300),
-			"passive" => Mode::Passive(300, 3600),
+			"dark" => Mode::Dark(Duration::from_secs(300)),
+			"passive" => Mode::Passive(Duration::from_secs(300), Duration::from_secs(3600)),
 			"active" => Mode::Active,
 			e => { return Err(errors::invalid_params("mode", e.to_owned())); },
 		});
@@ -170,7 +170,7 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 	}
 
 	fn hash_content(&self, url: String) -> BoxFuture<H256> {
-		let future = self.fetch.fetch(&url, Default::default()).then(move |result| {
+		let future = self.fetch.get(&url, Default::default()).then(move |result| {
 			result
 				.map_err(errors::fetch)
 				.and_then(move |response| {
@@ -183,11 +183,11 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 	}
 
 	fn dapps_refresh(&self) -> Result<bool> {
-		self.dapps.as_ref().map(|dapps| dapps.refresh_local_dapps()).ok_or_else(errors::dapps_disabled)
+		Err(errors::dapps_disabled())
 	}
 
 	fn dapps_list(&self) -> Result<Vec<LocalDapp>> {
-		self.dapps.as_ref().map(|dapps| dapps.list_dapps()).ok_or_else(errors::dapps_disabled)
+		Err(errors::dapps_disabled())
 	}
 
 	fn upgrade_ready(&self) -> Result<Option<ReleaseInfo>> {
@@ -202,6 +202,8 @@ impl<C, M, U, F> ParitySet for ParitySetClient<C, M, U, F> where
 		let block_number = self.client.chain_info().best_block_number;
 		let hash = hash.into();
 
-		Ok(self.miner.remove_pending_transaction(&*self.client, &hash).map(|t| Transaction::from_pending(t, block_number, self.eip86_transition)))
+		Ok(self.miner.remove_transaction(&hash)
+		   .map(|t| Transaction::from_pending(t.pending().clone(), block_number + 1, self.eip86_transition))
+		)
 	}
 }

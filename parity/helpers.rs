@@ -1,4 +1,4 @@
-// Copyright 2015-2017 Parity Technologies (UK) Ltd.
+// Copyright 2015-2018 Parity Technologies (UK) Ltd.
 // This file is part of Parity.
 
 // Parity is free software: you can redistribute it and/or modify
@@ -19,18 +19,18 @@ use std::io::{Write, BufReader, BufRead};
 use std::time::Duration;
 use std::fs::File;
 use ethereum_types::{U256, clean_0x, Address};
-use kvdb_rocksdb::CompactionProfile;
 use journaldb::Algorithm;
 use ethcore::client::{Mode, BlockId, VMType, DatabaseCompactionProfile, ClientConfig, VerifierType};
-use ethcore::miner::{PendingSet, GasLimit};
-use miner::transaction_queue::PrioritizationStrategy;
+use ethcore::miner::{PendingSet, Penalization};
+use miner::pool::PrioritizationStrategy;
 use cache::CacheConfig;
 use dir::DatabaseDirectories;
 use dir::helpers::replace_home;
 use upgrade::{upgrade, upgrade_data_paths};
-use migration::migrate;
-use ethsync::{validate_node_url, self};
+use sync::{validate_node_url, self};
+use db::migrate;
 use path;
+use ethkey::Password;
 
 pub fn to_duration(s: &str) -> Result<Duration, String> {
 	to_seconds(s).map(Duration::from_secs)
@@ -48,11 +48,11 @@ fn to_seconds(s: &str) -> Result<u64, String> {
 		"1minute" | "1 minute" | "minute" => Ok(60),
 		"hourly" | "1hour" | "1 hour" | "hour" => Ok(60 * 60),
 		"daily" | "1day" | "1 day" | "day" => Ok(24 * 60 * 60),
-		x if x.ends_with("seconds") => x[0..x.len() - 7].parse().map_err(bad),
-		x if x.ends_with("minutes") => x[0..x.len() - 7].parse::<u64>().map_err(bad).map(|x| x * 60),
-		x if x.ends_with("hours") => x[0..x.len() - 5].parse::<u64>().map_err(bad).map(|x| x * 60 * 60),
-		x if x.ends_with("days") => x[0..x.len() - 4].parse::<u64>().map_err(bad).map(|x| x * 24 * 60 * 60),
-		x => x.parse().map_err(bad),
+		x if x.ends_with("seconds") => x[0..x.len() - 7].trim().parse().map_err(bad),
+		x if x.ends_with("minutes") => x[0..x.len() - 7].trim().parse::<u64>().map_err(bad).map(|x| x * 60),
+		x if x.ends_with("hours") => x[0..x.len() - 5].trim().parse::<u64>().map_err(bad).map(|x| x * 60 * 60),
+		x if x.ends_with("days") => x[0..x.len() - 4].trim().parse::<u64>().map_err(bad).map(|x| x * 24 * 60 * 60),
+		x => x.trim().parse().map_err(bad),
 	}
 }
 
@@ -97,21 +97,20 @@ pub fn to_pending_set(s: &str) -> Result<PendingSet, String> {
 	}
 }
 
-pub fn to_gas_limit(s: &str) -> Result<GasLimit, String> {
+pub fn to_queue_strategy(s: &str) -> Result<PrioritizationStrategy, String> {
 	match s {
-		"auto" => Ok(GasLimit::Auto),
-		"off" => Ok(GasLimit::None),
-		other => Ok(GasLimit::Fixed(to_u256(other)?)),
+		"gas_price" => Ok(PrioritizationStrategy::GasPriceOnly),
+		other => Err(format!("Invalid queue strategy: {}", other)),
 	}
 }
 
-pub fn to_queue_strategy(s: &str) -> Result<PrioritizationStrategy, String> {
-	match s {
-		"gas" => Ok(PrioritizationStrategy::GasAndGasPrice),
-		"gas_price" => Ok(PrioritizationStrategy::GasPriceOnly),
-		"gas_factor" => Ok(PrioritizationStrategy::GasFactorAndGasPrice),
-		other => Err(format!("Invalid queue strategy: {}", other)),
-	}
+pub fn to_queue_penalization(time: Option<u64>) -> Result<Penalization, String> {
+	Ok(match time {
+		Some(threshold_ms) => Penalization::Enabled {
+			offend_threshold: Duration::from_millis(threshold_ms),
+		},
+		None => Penalization::Disabled,
+	})
 }
 
 pub fn to_address(s: Option<String>) -> Result<Address, String> {
@@ -170,7 +169,7 @@ pub fn to_bootnodes(bootnodes: &Option<String>) -> Result<Vec<String>, String> {
 		Some(ref x) if !x.is_empty() => x.split(',').map(|s| {
 			match validate_node_url(s).map(Into::into) {
 				None => Ok(s.to_owned()),
-				Some(ethsync::ErrorKind::AddressResolve(_)) => Err(format!("Failed to resolve hostname of a boot node: {}", s)),
+				Some(sync::ErrorKind::AddressResolve(_)) => Err(format!("Failed to resolve hostname of a boot node: {}", s)),
 				Some(_) => Err(format!("Invalid node address format given for a boot node: {}", s)),
 			}
 		}).collect(),
@@ -180,8 +179,8 @@ pub fn to_bootnodes(bootnodes: &Option<String>) -> Result<Vec<String>, String> {
 }
 
 #[cfg(test)]
-pub fn default_network_config() -> ::ethsync::NetworkConfiguration {
-	use ethsync::{NetworkConfiguration};
+pub fn default_network_config() -> ::sync::NetworkConfiguration {
+	use sync::{NetworkConfiguration};
 	use super::network::IpFilter;
 	NetworkConfiguration {
 		config_path: Some(replace_home(&::dir::default_data_path(), "$BASE/network")),
@@ -211,7 +210,6 @@ pub fn to_client_config(
 		tracing: bool,
 		fat_db: bool,
 		compaction: DatabaseCompactionProfile,
-		wal: bool,
 		vm_type: VMType,
 		name: String,
 		pruning: Algorithm,
@@ -247,7 +245,6 @@ pub fn to_client_config(
 	client_config.pruning = pruning;
 	client_config.history = pruning_history;
 	client_config.db_compaction = compaction;
-	client_config.db_wal = wal;
 	client_config.vm_type = vm_type;
 	client_config.name = name;
 	client_config.verifier_type = if check_seal { VerifierType::Canon } else { VerifierType::CanonNoSeal };
@@ -259,7 +256,7 @@ pub fn execute_upgrades(
 	base_path: &str,
 	dirs: &DatabaseDirectories,
 	pruning: Algorithm,
-	compaction_profile: CompactionProfile
+	compaction_profile: &DatabaseCompactionProfile
 ) -> Result<(), String> {
 
 	upgrade_data_paths(base_path, dirs, pruning);
@@ -279,7 +276,7 @@ pub fn execute_upgrades(
 }
 
 /// Prompts user asking for password.
-pub fn password_prompt() -> Result<String, String> {
+pub fn password_prompt() -> Result<Password, String> {
 	use rpassword::read_password;
 	const STDIN_ERROR: &'static str = "Unable to ask for password on non-interactive terminal.";
 
@@ -287,12 +284,12 @@ pub fn password_prompt() -> Result<String, String> {
 	print!("Type password: ");
 	flush_stdout();
 
-	let password = read_password().map_err(|_| STDIN_ERROR.to_owned())?;
+	let password = read_password().map_err(|_| STDIN_ERROR.to_owned())?.into();
 
 	print!("Repeat password: ");
 	flush_stdout();
 
-	let password_repeat = read_password().map_err(|_| STDIN_ERROR.to_owned())?;
+	let password_repeat = read_password().map_err(|_| STDIN_ERROR.to_owned())?.into();
 
 	if password != password_repeat {
 		return Err("Passwords do not match!".into());
@@ -302,24 +299,24 @@ pub fn password_prompt() -> Result<String, String> {
 }
 
 /// Read a password from password file.
-pub fn password_from_file(path: String) -> Result<String, String> {
+pub fn password_from_file(path: String) -> Result<Password, String> {
 	let passwords = passwords_from_files(&[path])?;
 	// use only first password from the file
-	passwords.get(0).map(String::to_owned)
+	passwords.get(0).map(Password::clone)
 		.ok_or_else(|| "Password file seems to be empty.".to_owned())
 }
 
 /// Reads passwords from files. Treats each line as a separate password.
-pub fn passwords_from_files(files: &[String]) -> Result<Vec<String>, String> {
+pub fn passwords_from_files(files: &[String]) -> Result<Vec<Password>, String> {
 	let passwords = files.iter().map(|filename| {
 		let file = File::open(filename).map_err(|_| format!("{} Unable to read password file. Ensure it exists and permissions are correct.", filename))?;
 		let reader = BufReader::new(&file);
 		let lines = reader.lines()
 			.filter_map(|l| l.ok())
-			.map(|pwd| pwd.trim().to_owned())
-			.collect::<Vec<String>>();
+			.map(|pwd| pwd.trim().to_owned().into())
+			.collect::<Vec<Password>>();
 		Ok(lines)
-	}).collect::<Result<Vec<Vec<String>>, String>>();
+	}).collect::<Result<Vec<Vec<Password>>, String>>();
 	Ok(passwords?.into_iter().flat_map(|x| x).collect())
 }
 
@@ -332,6 +329,7 @@ mod tests {
 	use ethereum_types::U256;
 	use ethcore::client::{Mode, BlockId};
 	use ethcore::miner::PendingSet;
+	use ethkey::Password;
 	use super::{to_duration, to_mode, to_block_id, to_u256, to_pending_set, to_address, to_addresses, to_price, geth_ipc_path, to_bootnodes, password_from_file};
 
 	#[test]
@@ -352,6 +350,8 @@ mod tests {
 		assert_eq!(to_duration("1day").unwrap(), Duration::from_secs(1 * 24 * 60 * 60));
 		assert_eq!(to_duration("2days").unwrap(), Duration::from_secs(2 * 24 *60 * 60));
 		assert_eq!(to_duration("15days").unwrap(), Duration::from_secs(15 * 24 * 60 * 60));
+		assert_eq!(to_duration("15 days").unwrap(), Duration::from_secs(15 * 24 * 60 * 60));
+		assert_eq!(to_duration("2  seconds").unwrap(), Duration::from_secs(2));
 	}
 
 	#[test]
@@ -435,7 +435,7 @@ ignored
 but the first password is trimmed
 
 "#).unwrap();
-		assert_eq!(&password_from_file(path.to_str().unwrap().into()).unwrap(), "password with trailing whitespace");
+		assert_eq!(password_from_file(path.to_str().unwrap().into()).unwrap(), Password::from("password with trailing whitespace"));
 	}
 
 	#[test]
